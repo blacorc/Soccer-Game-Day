@@ -145,6 +145,7 @@ function assignFieldPositions(fieldPlayers) {
 // ─── MAIN SCHEDULE GENERATOR ─────────────────────────────────
 
 function generateSchedule(attendees, seed = 0) {
+  try {
   // Seeded shuffle utility for re-optimize
   const seededRandom = (s) => {
     let x = Math.sin(s + 1) * 10000;
@@ -553,8 +554,8 @@ function generateSchedule(attendees, seed = 0) {
       currOnPitch.add(gkPlayer.id);
       fieldPlayers.forEach(p => currOnPitch.add(p.id));
 
-      comingOn = [...currOnPitch].filter(id => !prevOnPitch.has(id)).map(id => ALL.find(p => p.id === id));
-      comingOff = [...prevOnPitch].filter(id => !currOnPitch.has(id)).map(id => ALL.find(p => p.id === id));
+      comingOn = [...currOnPitch].filter(id => !prevOnPitch.has(id)).map(id => ALL.find(p => p.id === id)).filter(Boolean);
+      comingOff = [...prevOnPitch].filter(id => !currOnPitch.has(id)).map(id => ALL.find(p => p.id === id)).filter(Boolean);
     }
 
     if (s === 0 || s === 5) {
@@ -628,7 +629,7 @@ function generateSchedule(attendees, seed = 0) {
       if (stillUnassigned.length > 0) {
         const remaining = { DEF: 3, MID: 3, FWD: 2 };
         for (const id in positions) {
-          if (positions[id] !== "GK") remaining[positions[id]]--;
+          if (positions[id] && positions[id] !== "GK" && remaining[positions[id]] !== undefined) remaining[positions[id]]--;
         }
         for (const p of stillUnassigned) {
           for (const pos of ["DEF", "MID", "FWD"]) {
@@ -686,6 +687,10 @@ function generateSchedule(attendees, seed = 0) {
   });
 
   return { slots: slotsOutput, summary, error: null };
+  } catch (e) {
+    console.error("Schedule generation error:", e);
+    return { error: "Schedule generation failed: " + e.message, slots: [], summary: [] };
+  }
 }
 
 // ─── FIELD SVG ───────────────────────────────────────────────
@@ -1012,19 +1017,6 @@ function SoccerApp() {
     const avg = summary.length > 0 ? summary.reduce((s, p) => s + p.slotsPlayed, 0) / summary.length : 0;
     const minS = Math.min(...summary.map(p => p.slotsPlayed));
     const maxS = Math.max(...summary.map(p => p.slotsPlayed));
-
-    // Timer calculations
-    const totalGameSeconds = 50 * 60; // 50 min game
-    const currentSlot = Math.min(Math.floor(timerSeconds / 300), 9); // 300s = 5 min
-    const slotElapsed = timerSeconds % 300;
-    const slotRemaining = 300 - slotElapsed;
-    const isHalf = timerSeconds >= 25 * 60;
-    const displayMin = Math.floor(timerSeconds / 60);
-    const displaySec = timerSeconds % 60;
-    const nextSubIn = slotRemaining;
-    const nextSubMin = Math.floor(nextSubIn / 60);
-    const nextSubSec = nextSubIn % 60;
-    const gameOver = timerSeconds >= totalGameSeconds;
 
     return (
       <div>
