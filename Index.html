@@ -1,0 +1,1145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Pitch Manager</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚽</text></svg>" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
+  </style>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useMemo, useCallback } = React;
+
+/*
+ * ============================================================
+ * ROTATION ALGORITHM v3 — GK ROTATION MODEL
+ * ============================================================
+ *
+ * KEY CHANGE: GK is now a rotating position, not a fixed lock.
+ *
+ * GK RULES:
+ * - If Tuck (primary GK) is present:
+ *     Tuck plays GK for entire 1st half (slots 0-4).
+ *     One secondary GK plays entire 2nd half (slots 5-9).
+ *     Zero mid-half GK swaps. Tuck plays field in 2nd half.
+ * - If Tuck is absent:
+ *     Two secondary GKs each take a full half.
+ *
+ * CONTINUITY RULE: Players should stay on field for at least
+ * 2 consecutive slots when subbed on. Avoid single-slot cameos.
+ * This means: don't sub someone on if they'll be subbed off next slot.
+ *
+ * ALL 15 players participate in equal-time calculation.
+ * "On the pitch" = playing GK OR playing a field position.
+ *
+ * FORMATION: 1 GK + 3 DEF + 3 MID + 2 FWD = 9 on pitch
+ * 9 spots × 10 slots = 90 player-slots total.
+ * 90 / 15 = 6.0 → perfect: every player gets exactly 6 slots.
+ * If fewer than 15, some get 6, some get 7 (or 5/6 depending).
+ *
+ * PHASE 1: Assign GK for each slot.
+ *   - Tuck gets slots 1-5,6-8 (8 slots), secondary GKs get 2.
+ *   - Or distribute more evenly if user wants.
+ *   - "~25% for secondary" = 2-3 slots out of 10.
+ *
+ * PHASE 2: For each slot, the GK is fixed. The remaining 8
+ *   field spots are filled from the other 14 players (including
+ *   Tuck when he's not in goal).
+ *   - Same equal-time, C-constraint, sub-cadence logic as before.
+ *
+ * PHASE 3: Position assignment for the 8 field players per slot.
+ *
+ * PHASE 4: Post-process for balance and C-overlap.
+ * ============================================================
+ */
+
+const DEFAULT_ROSTER = [
+  { id: 1000, name: "Jillian", tier: "C", positions: { primary: "MID", secondary: [] } },
+  { id: 1001, name: "Julia", tier: "C", positions: { primary: "MID", secondary: ["DEF"] } },
+  { id: 1002, name: "Giana", tier: "C", positions: { primary: "DEF", secondary: ["MID", "FWD", "GK"] } },
+  { id: 1003, name: "Sam", tier: "A", positions: { primary: "MID", secondary: ["DEF", "FWD"] } },
+  { id: 1004, name: "Reed", tier: "A", positions: { primary: "MID", secondary: ["FWD", "DEF", "GK"] } },
+  { id: 1005, name: "Will", tier: "B", positions: { primary: "MID", secondary: ["GK", "DEF", "FWD"] } },
+  { id: 1006, name: "Ben", tier: "B", positions: { primary: "MID", secondary: ["GK", "DEF"] } },
+  { id: 1007, name: "Luke", tier: "C", positions: { primary: "DEF", secondary: ["GK", "MID"] } },
+  { id: 1008, name: "Cal", tier: "B", positions: { primary: "MID", secondary: ["DEF", "FWD"] } },
+  { id: 1009, name: "Finch", tier: "B", positions: { primary: "DEF", secondary: ["GK"] } },
+  { id: 1010, name: "Jake", tier: "A", positions: { primary: "DEF", secondary: ["FWD"] } },
+  { id: 1011, name: "Tuck", tier: "B", positions: { primary: "GK", secondary: ["DEF"] } },
+  { id: 1012, name: "Henry", tier: "C", positions: { primary: "DEF", secondary: ["MID"] } },
+  { id: 1013, name: "Jonathan", tier: "A", positions: { primary: "MID", secondary: ["DEF", "FWD"] } },
+  { id: 1014, name: "Brian", tier: "C", positions: { primary: "MID", secondary: ["FWD"] } },
+];
+
+const SLOT_LABELS = [
+  { time: "0:00", label: "Kickoff" },
+  { time: "5:00", label: "" },
+  { time: "10:00", label: "" },
+  { time: "15:00", label: "" },
+  { time: "20:00", label: "" },
+  { time: "25:00", label: "2nd Half" },
+  { time: "30:00", label: "" },
+  { time: "35:00", label: "" },
+  { time: "40:00", label: "" },
+  { time: "45:00", label: "" },
+];
+
+const POS_LIST = ["GK", "DEF", "MID", "FWD"];
+const TIER_COLORS = { A: "#22c55e", B: "#3b82f6", C: "#f59e0b" };
+const TIER_BG = { A: "rgba(34,197,94,0.15)", B: "rgba(59,130,246,0.15)", C: "rgba(245,158,11,0.15)" };
+
+// ─── HELPERS ─────────────────────────────────────────────────
+
+function canPlayGK(player) {
+  return player.positions.primary === "GK" || player.positions.secondary.includes("GK");
+}
+
+function canPlayField(player, pos) {
+  if (pos === "GK") return false;
+  return player.positions.primary === pos || player.positions.secondary.includes(pos);
+}
+
+function assignFieldPositions(fieldPlayers) {
+  /* Assign 8 players to 3 DEF + 3 MID + 2 FWD using constraint propagation */
+  const remaining = { DEF: 3, MID: 3, FWD: 2 };
+  const assignments = {};
+  const pool = [...fieldPlayers];
+
+  const getOpts = (p) => {
+    const o = [];
+    for (const pos of ["DEF", "MID", "FWD"]) {
+      if (remaining[pos] > 0 && canPlayField(p, pos)) o.push(pos);
+    }
+    return o;
+  };
+
+  while (pool.length > 0) {
+    pool.sort((a, b) => getOpts(a).length - getOpts(b).length);
+    const p = pool.shift();
+    const opts = getOpts(p);
+    if (opts.length === 0) {
+      // Force-assign to any open slot
+      for (const pos of ["DEF", "MID", "FWD"]) {
+        if (remaining[pos] > 0) { assignments[p.id] = pos; remaining[pos]--; break; }
+      }
+    } else {
+      const pri = p.positions.primary;
+      if (pri !== "GK" && opts.includes(pri)) {
+        assignments[p.id] = pri; remaining[pri]--;
+      } else {
+        assignments[p.id] = opts[0]; remaining[opts[0]]--;
+      }
+    }
+  }
+  return assignments;
+}
+
+// ─── MAIN SCHEDULE GENERATOR ─────────────────────────────────
+
+function generateSchedule(attendees, seed = 0) {
+  // Seeded shuffle utility for re-optimize
+  const seededRandom = (s) => {
+    let x = Math.sin(s + 1) * 10000;
+    return x - Math.floor(x);
+  };
+  const shuffleArray = (arr) => {
+    const a = [...arr];
+    for (let i = a.length - 1; i > 0; i--) {
+      const j = Math.floor(seededRandom(seed * 1000 + i) * (i + 1));
+      [a[i], a[j]] = [a[j], a[i]];
+    }
+    return a;
+  };
+
+  const ALL = seed > 0 ? shuffleArray([...attendees]) : [...attendees];
+  const N = ALL.length;
+  if (N < 9) return { error: `Need at least 9 players (have ${N})`, slots: [], summary: [] };
+
+  const SLOTS = 10;
+  const ON_PITCH = 9; // GK + 8 field
+  const FIELD_SPOTS = 8;
+  const SUBS = 3;
+
+  // Identify GK-eligible players
+  const primaryGK = ALL.find(p => p.positions.primary === "GK");
+  const secondaryGKs = ALL.filter(p => p.positions.secondary.includes("GK") && p.positions.primary !== "GK");
+  const gkEligible = primaryGK ? [primaryGK, ...secondaryGKs] : [...secondaryGKs];
+
+  if (gkEligible.length === 0) {
+    return { error: "No GK-eligible players available!", slots: [], summary: [] };
+  }
+
+  // ── PHASE 1: Assign GK per slot ──
+  const gkSchedule = new Array(SLOTS).fill(null); // player object per slot
+
+  if (primaryGK) {
+    // One GK per half, no mid-half swaps.
+    // Tuck plays full 1st half (slots 0-4, 25 min).
+    // One secondary GK plays full 2nd half (slots 5-9, 25 min).
+    // Tuck moves to field (DEF) in the 2nd half.
+    const sec1 = secondaryGKs[0] || primaryGK; // fallback if no secondaries
+
+    for (let s = 0; s < SLOTS; s++) {
+      gkSchedule[s] = s < 5 ? primaryGK : sec1;
+    }
+  } else {
+    // No primary GK — split halves between two secondary GKs.
+    const gk1 = gkEligible[0];
+    const gk2 = gkEligible.length > 1 ? gkEligible[1] : gkEligible[0];
+    for (let s = 0; s < SLOTS; s++) {
+      gkSchedule[s] = s < 5 ? gk1 : gk2;
+    }
+  }
+
+  // ── PHASE 2: Assign 8 field players per slot ──
+  // All players participate. For each slot, the GK player is fixed.
+  // The remaining 8 field spots are filled from everyone else.
+  //
+  // Equal time: 9 spots × 10 slots = 90 player-slots.
+  // Each player's "on pitch" count = GK slots + field slots.
+  // 90 / N player-slots to distribute.
+
+  const totalPitchSlots = ON_PITCH * SLOTS; // 90
+  const targetHigh = Math.ceil(totalPitchSlots / N);
+  const targetLow = Math.floor(totalPitchSlots / N);
+  const numHigh = totalPitchSlots - targetLow * N;
+
+  const cIds = new Set(ALL.filter(p => p.tier === "C").map(p => p.id));
+  const playerIdx = {}; // id -> index
+  ALL.forEach((p, i) => { playerIdx[p.id] = i; });
+
+  // Track: grid[i][s] = "GK" | "FIELD" | null
+  const grid = ALL.map(() => new Array(SLOTS).fill(null));
+
+  // Pre-fill GK assignments
+  for (let s = 0; s < SLOTS; s++) {
+    const gkPlayer = gkSchedule[s];
+    const idx = playerIdx[gkPlayer.id];
+    grid[idx][s] = "GK";
+  }
+
+  // Count total pitch time per player (GK counts as pitch time)
+  const pitchCount = () => ALL.map((_, i) => grid[i].filter(v => v !== null).length);
+
+  // Assign targets
+  const targets = new Array(N).fill(targetLow);
+  // Sort to decide who gets the extra slot
+  const sortedForTarget = ALL.map((p, i) => i);
+  sortedForTarget.sort((a, b) => {
+    // Players already assigned GK slots may have a head start; give targetHigh to those with fewer GK slots
+    const gkA = grid[a].filter(v => v === "GK").length;
+    const gkB = grid[b].filter(v => v === "GK").length;
+    if (gkA !== gkB) return gkA - gkB; // fewer GK → more flexible → give high target
+    const cA = cIds.has(ALL[a].id) ? 1 : 0;
+    const cB = cIds.has(ALL[b].id) ? 1 : 0;
+    return cA - cB; // non-C players get high targets first
+  });
+  let highLeft = numHigh;
+  for (const idx of sortedForTarget) {
+    if (highLeft > 0) { targets[idx] = targetHigh; highLeft--; }
+  }
+
+  // Greedy fill field spots slot by slot
+  const consBench = new Array(N).fill(0);
+  const consField = new Array(N).fill(0);
+
+  for (let s = 0; s < SLOTS; s++) {
+    const gkIdx = playerIdx[gkSchedule[s].id];
+    // Available pool: everyone except the GK for this slot
+    const available = ALL.map((_, i) => i).filter(i => i !== gkIdx);
+
+    const slotsRemaining = SLOTS - s;
+    const currentCounts = pitchCount();
+
+    // Calculate need: how many field slots does each player still need?
+    const need = available.map(i => {
+      const current = currentCounts[i];
+      const remaining = targets[i] - current;
+      return { idx: i, need: remaining, urgency: remaining / slotsRemaining };
+    });
+
+    if (s === 0 || s === 5) {
+      // Fresh lineup (kickoff or halftime reset)
+      need.sort((a, b) => {
+        if (b.urgency !== a.urgency) return b.urgency - a.urgency;
+        return consBench[b.idx] - consBench[a.idx];
+      });
+
+      const selected = new Set();
+      let cFieldCount = 0;
+
+      for (const u of need) {
+        if (selected.size >= FIELD_SPOTS) break;
+        const isCp = cIds.has(ALL[u.idx].id);
+        if (isCp && cFieldCount >= 1 && u.urgency < 0.55) continue;
+        selected.add(u.idx);
+        if (isCp) cFieldCount++;
+      }
+      // Backfill if needed
+      for (const u of need) {
+        if (selected.size >= FIELD_SPOTS) break;
+        selected.add(u.idx);
+      }
+
+      for (const i of selected) grid[i][s] = "FIELD";
+
+    } else {
+      // Normal sub: 3 players rotate.
+      // CONTINUITY: Players should stay on for at least 2 consecutive slots.
+      // Don't sub off anyone with consField[i] < 2 unless forced.
+      const prevField = new Set();
+      for (let i = 0; i < N; i++) {
+        if (grid[i][s - 1] === "FIELD") prevField.add(i);
+      }
+
+      const prevGkIdx = playerIdx[gkSchedule[s - 1].id];
+      const stayingPool = [...prevField].filter(i => i !== gkIdx);
+      const benchPool = available.filter(i => !prevField.has(i) && i !== gkIdx);
+      if (prevGkIdx !== gkIdx && !prevField.has(prevGkIdx)) {
+        benchPool.push(prevGkIdx);
+      }
+      const gkWasField = prevField.has(gkIdx);
+      const prevGkNowAvailable = prevGkIdx !== gkIdx;
+
+      let targetSubs = SUBS;
+
+      // Must come on: bench players sitting ≥ 2 consecutive and still need slots
+      const countsNow = pitchCount();
+      const mustOn = benchPool.filter(i => consBench[i] >= 2 && (targets[i] - countsNow[i]) > 0);
+
+      // Eligible to come off: prefer players on field ≥ 2 consecutive slots.
+      // Players with consField < 2 are "protected" — only sub them off as last resort.
+      const eligibleOff = [...stayingPool].sort((a, b) => {
+        // Protected players (on field < 2 slots) sort to the end
+        const protA = consField[a] < 2 ? 1 : 0;
+        const protB = consField[b] < 2 ? 1 : 0;
+        if (protA !== protB) return protA - protB; // unprotected first
+        // Among unprotected: highest count first, then longest on field
+        const overA = countsNow[a] - targets[a];
+        const overB = countsNow[b] - targets[b];
+        if (overA !== overB) return overB - overA;
+        if (countsNow[b] !== countsNow[a]) return countsNow[b] - countsNow[a];
+        return consField[b] - consField[a];
+      });
+
+      const sortedBench = [...benchPool].sort((a, b) => {
+        const needA = targets[a] - countsNow[a];
+        const needB = targets[b] - countsNow[b];
+        if (needB !== needA) return needB - needA;
+        if (consBench[b] !== consBench[a]) return consBench[b] - consBench[a];
+        return countsNow[a] - countsNow[b];
+      });
+
+      let comingOff = [];
+      let comingOn = [];
+
+      // GK swap handling
+      if (prevGkNowAvailable) {
+        const prevGkNeed = targets[prevGkIdx] - countsNow[prevGkIdx];
+        if (prevGkNeed > 0) comingOn.push(prevGkIdx);
+      }
+      if (gkWasField) comingOff.push(gkIdx);
+
+      // Must-on players
+      for (const i of mustOn) {
+        if (!comingOn.includes(i)) comingOn.push(i);
+      }
+
+      // Fill to target subs
+      const subsTarget = Math.max(targetSubs, comingOn.length, comingOff.length);
+
+      for (const i of sortedBench) {
+        if (comingOn.length >= subsTarget) break;
+        if (!comingOn.includes(i)) comingOn.push(i);
+      }
+
+      for (const i of eligibleOff) {
+        if (comingOff.length >= subsTarget) break;
+        if (!comingOff.includes(i) && i !== gkIdx) comingOff.push(i);
+      }
+
+      // Balance on/off counts
+      const subCount = Math.min(comingOn.length, comingOff.length);
+      let actualOff = comingOff.slice(0, subCount);
+      let actualOn = comingOn.slice(0, subCount);
+
+      // Build new field set
+      const newField = new Set();
+      for (const i of stayingPool) {
+        if (!actualOff.includes(i)) newField.add(i);
+      }
+      for (const i of actualOn) {
+        if (i !== gkIdx) newField.add(i);
+      }
+
+      // Ensure exactly FIELD_SPOTS
+      while (newField.size > FIELD_SPOTS) {
+        const arr = [...newField];
+        const counts = pitchCount();
+        arr.sort((a, b) => counts[b] - counts[a]);
+        newField.delete(arr[0]);
+      }
+      while (newField.size < FIELD_SPOTS) {
+        const counts = pitchCount();
+        const candidates = available.filter(i => !newField.has(i) && i !== gkIdx);
+        candidates.sort((a, b) => counts[a] - counts[b]);
+        if (candidates.length > 0) newField.add(candidates[0]);
+        else break;
+      }
+
+      for (const i of newField) grid[i][s] = "FIELD";
+    }
+
+    // Update consecutive trackers
+    for (let i = 0; i < N; i++) {
+      if (grid[i][s] !== null) {
+        consField[i]++;
+        consBench[i] = 0;
+      } else {
+        consBench[i]++;
+        consField[i] = 0;
+      }
+    }
+  }
+
+  // ── PHASE 3: Balance post-processing ──
+  for (let pass = 0; pass < 30; pass++) {
+    let improved = false;
+    const counts = pitchCount();
+    for (let i = 0; i < N; i++) {
+      if (counts[i] > targetHigh) {
+        // Over target — swap out of a FIELD slot with an under-target bench player
+        for (let s = 0; s < SLOTS; s++) {
+          if (grid[i][s] !== "FIELD") continue;
+          for (let j = 0; j < N; j++) {
+            if (j === i || grid[j][s] !== null) continue;
+            if (counts[j] >= targetHigh) continue;
+            if (j === playerIdx[gkSchedule[s].id]) continue; // can't swap with GK
+            // Check sub constraint
+            if (checkTransitions(grid, N, SLOTS, SUBS, i, j, s)) {
+              grid[i][s] = null; grid[j][s] = "FIELD";
+              counts[i]--; counts[j]++;
+              improved = true; break;
+            }
+          }
+          if (improved) break;
+        }
+      } else if (counts[i] < targetLow) {
+        for (let s = 0; s < SLOTS; s++) {
+          if (grid[i][s] !== null) continue;
+          if (i === playerIdx[gkSchedule[s].id]) continue;
+          for (let j = 0; j < N; j++) {
+            if (j === i || grid[j][s] !== "FIELD") continue;
+            if (counts[j] <= targetLow) continue;
+            if (checkTransitions(grid, N, SLOTS, SUBS, j, i, s)) {
+              grid[j][s] = null; grid[i][s] = "FIELD";
+              counts[j]--; counts[i]++;
+              improved = true; break;
+            }
+          }
+          if (improved) break;
+        }
+      }
+    }
+    if (!improved) break;
+  }
+
+  // ── PHASE 4: C-overlap reduction ──
+  for (let pass = 0; pass < 40; pass++) {
+    let improved = false;
+    const counts = pitchCount();
+    for (let s = 0; s < SLOTS; s++) {
+      const fieldIds = [];
+      for (let i = 0; i < N; i++) {
+        if (grid[i][s] === "FIELD") fieldIds.push(i);
+      }
+      const cField = fieldIds.filter(i => cIds.has(ALL[i].id));
+      // Also check if GK is C
+      const gkThisSlot = playerIdx[gkSchedule[s].id];
+      const cOnPitch = cField.length + (cIds.has(ALL[gkThisSlot].id) ? 1 : 0);
+      if (cOnPitch <= 1) continue;
+
+      // Try swapping a C field player with a non-C bench player
+      for (const ci of cField) {
+        for (let j = 0; j < N; j++) {
+          if (grid[j][s] !== null || cIds.has(ALL[j].id)) continue;
+          if (j === gkThisSlot) continue;
+          if (counts[ci] - 1 < targetLow || counts[j] + 1 > targetHigh) continue;
+          if (checkTransitions(grid, N, SLOTS, SUBS, ci, j, s)) {
+            grid[ci][s] = null; grid[j][s] = "FIELD";
+            counts[ci]--; counts[j]++;
+            improved = true; break;
+          }
+        }
+        if (improved) break;
+      }
+      if (improved) break;
+    }
+    if (!improved) break;
+  }
+
+  function checkTransitions(g, n, totalSlots, maxSubs, removeIdx, addIdx, slot) {
+    if (slot === 5) return true; // halftime reset
+    const getOnPitch = (s, applySwap) => {
+      const set = new Set();
+      for (let i = 0; i < n; i++) {
+        let val = g[i][s] !== null;
+        if (applySwap && s === slot) {
+          if (i === removeIdx) val = false;
+          if (i === addIdx) val = true;
+        }
+        if (val) set.add(i);
+      }
+      return set;
+    };
+
+    // Check transition from slot-1 to slot
+    if (slot > 0 && slot !== 5) {
+      const prev = getOnPitch(slot - 1, false);
+      const curr = getOnPitch(slot, true);
+      let off = 0;
+      for (const i of prev) if (!curr.has(i)) off++;
+      // Allow up to maxSubs + 1 because GK swaps can cause extra
+      if (off > maxSubs + 1) return false;
+    }
+    // Check transition from slot to slot+1
+    if (slot < totalSlots - 1 && slot + 1 !== 5) {
+      const curr = getOnPitch(slot, true);
+      const next = getOnPitch(slot + 1, false);
+      let off = 0;
+      for (const i of curr) if (!next.has(i)) off++;
+      if (off > maxSubs + 1) return false;
+    }
+    return true;
+  }
+
+  // ── PHASE 5: Build output with 1-for-1 position swaps ──
+  // Slot 0 and slot 5 (halftime): assign positions from scratch.
+  // All other slots: players staying on keep their positions.
+  // Each sub coming on inherits the position of the player they replace.
+  const slotsOutput = [];
+  let prevPositions = {}; // id -> position, carried between slots
+
+  for (let s = 0; s < SLOTS; s++) {
+    const gkPlayer = gkSchedule[s];
+    const gkIdx = playerIdx[gkPlayer.id];
+    const fieldPlayers = [];
+    const benchPlayers = [];
+
+    for (let i = 0; i < N; i++) {
+      if (i === gkIdx) continue;
+      if (grid[i][s] === "FIELD") fieldPlayers.push(ALL[i]);
+      else if (grid[i][s] === null) benchPlayers.push(ALL[i]);
+    }
+
+    let comingOn = [];
+    let comingOff = [];
+    let positions = {};
+
+    if (s > 0) {
+      const prevOnPitch = new Set();
+      for (let i = 0; i < N; i++) {
+        if (grid[i][s - 1] !== null) prevOnPitch.add(ALL[i].id);
+      }
+      const currOnPitch = new Set();
+      currOnPitch.add(gkPlayer.id);
+      fieldPlayers.forEach(p => currOnPitch.add(p.id));
+
+      comingOn = [...currOnPitch].filter(id => !prevOnPitch.has(id)).map(id => ALL.find(p => p.id === id));
+      comingOff = [...prevOnPitch].filter(id => !currOnPitch.has(id)).map(id => ALL.find(p => p.id === id));
+    }
+
+    if (s === 0 || s === 5) {
+      // Fresh assignment from scratch
+      positions = assignFieldPositions(fieldPlayers);
+    } else {
+      // 1-for-1 swap: staying players keep their positions
+      const vacatedPositions = []; // positions freed by players going off
+
+      // Carry over positions for staying players
+      for (const p of fieldPlayers) {
+        if (prevPositions[p.id] && !comingOn.find(x => x.id === p.id)) {
+          positions[p.id] = prevPositions[p.id];
+        }
+      }
+
+      // Collect vacated positions from players going off (field positions only)
+      for (const p of comingOff) {
+        const pos = prevPositions[p.id];
+        if (pos && pos !== "GK") vacatedPositions.push(pos);
+      }
+
+      // If GK changed, the old GK's "GK" slot is now filled by new GK,
+      // and old GK might be coming on as a field player — they need a position.
+      // The new GK might have been a field player — their old field position is vacated.
+      const prevGkId = s > 0 ? gkSchedule[s - 1].id : null;
+      if (prevGkId && prevGkId !== gkPlayer.id) {
+        // New GK was possibly a field player — vacate their old position
+        const newGkOldPos = prevPositions[gkPlayer.id];
+        if (newGkOldPos && newGkOldPos !== "GK") {
+          vacatedPositions.push(newGkOldPos);
+        }
+      }
+
+      // Assign incoming players to vacated positions using best fit
+      const unassigned = comingOn.filter(p => !positions[p.id] && p.id !== gkPlayer.id);
+
+      // Sort vacated by scarcity, assign most constrained incoming player first
+      for (const p of unassigned.sort((a, b) => {
+        const aOpts = vacatedPositions.filter(pos => canPlayField(a, pos)).length;
+        const bOpts = vacatedPositions.filter(pos => canPlayField(b, pos)).length;
+        return aOpts - bOpts;
+      })) {
+        // Try to match to a vacated position they can play
+        let assigned = false;
+        // Prefer their primary position if vacated
+        const priIdx = vacatedPositions.indexOf(p.positions.primary);
+        if (priIdx !== -1 && p.positions.primary !== "GK") {
+          positions[p.id] = p.positions.primary;
+          vacatedPositions.splice(priIdx, 1);
+          assigned = true;
+        }
+        if (!assigned) {
+          for (let vi = 0; vi < vacatedPositions.length; vi++) {
+            if (canPlayField(p, vacatedPositions[vi])) {
+              positions[p.id] = vacatedPositions[vi];
+              vacatedPositions.splice(vi, 1);
+              assigned = true;
+              break;
+            }
+          }
+        }
+        if (!assigned && vacatedPositions.length > 0) {
+          // Force assign to any vacated slot
+          positions[p.id] = vacatedPositions.shift();
+        }
+      }
+
+      // Fallback: if any field player still unassigned, do a mini-assignment
+      const stillUnassigned = fieldPlayers.filter(p => !positions[p.id]);
+      if (stillUnassigned.length > 0) {
+        const remaining = { DEF: 3, MID: 3, FWD: 2 };
+        for (const id in positions) {
+          if (positions[id] !== "GK") remaining[positions[id]]--;
+        }
+        for (const p of stillUnassigned) {
+          for (const pos of ["DEF", "MID", "FWD"]) {
+            if (remaining[pos] > 0 && canPlayField(p, pos)) {
+              positions[p.id] = pos; remaining[pos]--; break;
+            }
+          }
+          if (!positions[p.id]) {
+            for (const pos of ["DEF", "MID", "FWD"]) {
+              if (remaining[pos] > 0) { positions[p.id] = pos; remaining[pos]--; break; }
+            }
+          }
+        }
+      }
+    }
+
+    positions[gkPlayer.id] = "GK";
+    prevPositions = { ...positions };
+
+    const onPitchAll = [gkPlayer, ...fieldPlayers];
+    const cCount = onPitchAll.filter(p => cIds.has(p.id)).length;
+
+    slotsOutput.push({
+      slotIndex: s,
+      time: SLOT_LABELS[s].time,
+      label: SLOT_LABELS[s].label,
+      gk: gkPlayer,
+      onField: fieldPlayers,
+      bench: benchPlayers,
+      positions,
+      comingOn,
+      comingOff,
+      cCount,
+      gkChanged: s > 0 && gkSchedule[s].id !== gkSchedule[s - 1].id,
+    });
+  }
+
+  // Summary — ALL players including GK
+  const summary = ALL.map((p, i) => {
+    const totalOnPitch = grid[i].filter(v => v !== null).length;
+    const gkSlots = grid[i].filter(v => v === "GK").length;
+    const fieldSlots = grid[i].filter(v => v === "FIELD").length;
+    const posUsed = new Set();
+    slotsOutput.forEach(sl => {
+      if (sl.positions[p.id]) posUsed.add(sl.positions[p.id]);
+    });
+    return {
+      ...p,
+      slotsPlayed: totalOnPitch,
+      gkSlots,
+      fieldSlots,
+      totalMinutes: totalOnPitch * 5,
+      positionsUsed: [...posUsed],
+    };
+  });
+
+  return { slots: slotsOutput, summary, error: null };
+}
+
+// ─── FIELD SVG ───────────────────────────────────────────────
+function FieldGraphic({ slot }) {
+  const { gk, onField, positions, comingOn, comingOff, bench, gkChanged } = slot;
+  const comingOnIds = new Set((comingOn || []).map(p => p.id));
+  const comingOffIds = new Set((comingOff || []).map(p => p.id));
+
+  const posCoords = {
+    GK: [{ x: 50, y: 92 }],
+    DEF: [{ x: 18, y: 74 }, { x: 50, y: 72 }, { x: 82, y: 74 }],
+    MID: [{ x: 18, y: 48 }, { x: 50, y: 46 }, { x: 82, y: 48 }],
+    FWD: [{ x: 33, y: 23 }, { x: 67, y: 23 }],
+  };
+
+  const nodes = [];
+
+  // GK node
+  const isGkSubOn = comingOnIds.has(gk.id);
+  const isGkSubOff = comingOffIds.has(gk.id);
+  nodes.push({ player: gk, pos: "GK", coord: posCoords.GK[0], isGk: true, isSubOn: isGkSubOn || gkChanged, isSubOff: false });
+
+  // Field players
+  const grouped = { DEF: [], MID: [], FWD: [] };
+  onField.forEach(p => {
+    const pos = positions[p.id];
+    if (pos && grouped[pos]) grouped[pos].push(p);
+  });
+
+  ["DEF", "MID", "FWD"].forEach(pos => {
+    grouped[pos].forEach((p, i) => {
+      if (posCoords[pos][i]) {
+        nodes.push({
+          player: p, pos, coord: posCoords[pos][i],
+          isSubOn: comingOnIds.has(p.id),
+          isSubOff: comingOffIds.has(p.id),
+        });
+      }
+    });
+  });
+
+  const renderNode = ({ player, pos, coord, isSubOn, isSubOff, isGk: isGoalkeeper }) => {
+    const cx = (coord.x / 100) * 300;
+    const cy = (coord.y / 100) * 420;
+
+    let border = "rgba(255,255,255,0.45)";
+    let glow = "none";
+    let bg = "rgba(8,24,12,0.88)";
+
+    if (isGoalkeeper) { bg = "#1a3d5c"; border = "#5b9bd5"; }
+    if (isSubOn) { border = "#4ade80"; glow = "rgba(74,222,128,0.3)"; if (!isGoalkeeper) bg = "rgba(22,101,52,0.85)"; }
+    if (isSubOff) { border = "#fbbf24"; glow = "rgba(251,191,36,0.25)"; bg = "rgba(120,80,0,0.55)"; }
+
+    const nm = player.name.length > 7 ? player.name.slice(0, 6) + "…" : player.name;
+
+    return (
+      <g key={`${player.id}-${pos}-${cx}`}>
+        {glow !== "none" && <circle cx={cx} cy={cy} r="28" fill={glow} />}
+        <circle cx={cx} cy={cy} r="20" fill={bg} stroke={border} strokeWidth="2" />
+        <text x={cx} y={cy + 1} textAnchor="middle" dominantBaseline="middle"
+          fontSize="9" fontWeight="700" fill="white" fontFamily="system-ui">{nm}</text>
+        <circle cx={cx + 15} cy={cy - 14} r="7" fill={TIER_COLORS[player.tier]} />
+        <text x={cx + 15} y={cy - 13.5} textAnchor="middle" dominantBaseline="middle"
+          fontSize="8" fontWeight="800" fill="white">{player.tier}</text>
+        <rect x={cx - 12} y={cy + 23} width="24" height="12" rx="3" fill="rgba(0,0,0,0.5)" />
+        <text x={cx} y={cy + 29.5} textAnchor="middle" dominantBaseline="middle"
+          fontSize="7" fill="rgba(255,255,255,0.6)" fontWeight="600">{pos}</text>
+      </g>
+    );
+  };
+
+  return (
+    <div style={{ width: "100%", maxWidth: 380, margin: "0 auto" }}>
+      <svg viewBox="0 0 300 420" style={{ width: "100%", height: "auto", display: "block" }}>
+        <defs>
+          <linearGradient id="pitch" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="#1a6b30" />
+            <stop offset="50%" stopColor="#187028" />
+            <stop offset="100%" stopColor="#1a6b30" />
+          </linearGradient>
+        </defs>
+        <rect x="0" y="0" width="300" height="420" rx="10" fill="url(#pitch)" />
+        {[0,1,2,3,4,5,6].map(i => (
+          <rect key={i} x="0" y={i*60} width="300" height="30" fill="rgba(255,255,255,0.02)" />
+        ))}
+        <rect x="12" y="12" width="276" height="396" rx="4" fill="none" stroke="rgba(255,255,255,0.3)" strokeWidth="1.5" />
+        <line x1="12" y1="210" x2="288" y2="210" stroke="rgba(255,255,255,0.3)" strokeWidth="1.5" />
+        <circle cx="150" cy="210" r="36" fill="none" stroke="rgba(255,255,255,0.2)" strokeWidth="1.2" />
+        <circle cx="150" cy="210" r="3" fill="rgba(255,255,255,0.3)" />
+        <rect x="72" y="12" width="156" height="65" fill="none" stroke="rgba(255,255,255,0.2)" strokeWidth="1" />
+        <rect x="108" y="12" width="84" height="28" fill="none" stroke="rgba(255,255,255,0.15)" strokeWidth="1" />
+        <rect x="72" y="343" width="156" height="65" fill="none" stroke="rgba(255,255,255,0.2)" strokeWidth="1" />
+        <rect x="108" y="380" width="84" height="28" fill="none" stroke="rgba(255,255,255,0.15)" strokeWidth="1" />
+        <path d="M12,22 A10,10 0 0,1 22,12" fill="none" stroke="rgba(255,255,255,0.15)" strokeWidth="1" />
+        <path d="M278,12 A10,10 0 0,1 288,22" fill="none" stroke="rgba(255,255,255,0.15)" strokeWidth="1" />
+        <path d="M12,398 A10,10 0 0,0 22,408" fill="none" stroke="rgba(255,255,255,0.15)" strokeWidth="1" />
+        <path d="M278,408 A10,10 0 0,0 288,398" fill="none" stroke="rgba(255,255,255,0.15)" strokeWidth="1" />
+
+        <text x="150" y="100" textAnchor="middle" fontSize="16" fill="rgba(255,255,255,0.06)" fontWeight="900">FWD</text>
+        <text x="150" y="208" textAnchor="middle" fontSize="16" fill="rgba(255,255,255,0.06)" fontWeight="900">MID</text>
+        <text x="150" y="316" textAnchor="middle" fontSize="16" fill="rgba(255,255,255,0.06)" fontWeight="900">DEF</text>
+        <text x="150" y="400" textAnchor="middle" fontSize="14" fill="rgba(255,255,255,0.06)" fontWeight="900">GK</text>
+
+        {nodes.map(renderNode)}
+      </svg>
+
+      <div style={{ marginTop: 8, padding: "8px 12px", background: "rgba(0,0,0,0.35)", borderRadius: 8, border: "1px solid rgba(255,255,255,0.08)" }}>
+        <div style={{ fontSize: 10, fontWeight: 700, color: "rgba(255,255,255,0.35)", textTransform: "uppercase", letterSpacing: 1.2, marginBottom: 5 }}>
+          Bench ({bench.length})
+        </div>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
+          {bench.map(p => (
+            <span key={p.id} style={{ fontSize: 11, padding: "3px 8px", borderRadius: 5, background: TIER_BG[p.tier], color: "rgba(255,255,255,0.75)", border: `1px solid ${TIER_COLORS[p.tier]}30`, fontWeight: 500 }}>
+              {p.name}<span style={{ fontSize: 9, marginLeft: 3, color: TIER_COLORS[p.tier], fontWeight: 700 }}>{p.tier}</span>
+            </span>
+          ))}
+          {bench.length === 0 && <span style={{ fontSize: 11, color: "rgba(255,255,255,0.3)", fontStyle: "italic" }}>None</span>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── APP COMPONENT ───────────────────────────────────────────
+function SoccerApp() {
+  const [screen, setScreen] = useState("roster");
+  // ── Persist roster to localStorage ──
+  const STORAGE_KEY = "pitchManagerRoster";
+
+  const loadRoster = () => {
+    try {
+      const saved = localStorage.getItem(STORAGE_KEY);
+      if (saved) return JSON.parse(saved);
+    } catch (e) {}
+    return null;
+  };
+
+  const [roster, setRoster] = useState(() => loadRoster() || DEFAULT_ROSTER);
+
+  // Save roster whenever it changes
+  React.useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(roster));
+    } catch (e) {}
+  }, [roster]);
+
+  const resetRoster = useCallback(() => {
+    setRoster(DEFAULT_ROSTER);
+    localStorage.removeItem(STORAGE_KEY);
+  }, []);
+  const [editingId, setEditingId] = useState(null);
+  const [checkedIn, setCheckedIn] = useState(new Set());
+  const [scheduleData, setScheduleData] = useState(null);
+  const [seed, setSeed] = useState(0);
+
+  const [newName, setNewName] = useState("");
+  const [newTier, setNewTier] = useState("B");
+  const [newPrimary, setNewPrimary] = useState("MID");
+  const [newSecondary, setNewSecondary] = useState([]);
+  const [editName, setEditName] = useState("");
+  const [editTier, setEditTier] = useState("B");
+  const [editPrimary, setEditPrimary] = useState("MID");
+  const [editSecondary, setEditSecondary] = useState([]);
+
+  const nextId = useMemo(() => roster.length > 0 ? Math.max(...roster.map(p => p.id)) + 1 : 1000, [roster]);
+
+  const addPlayer = useCallback(() => {
+    if (!newName.trim()) return;
+    setRoster(prev => [...prev, { id: nextId, name: newName.trim(), tier: newTier, positions: { primary: newPrimary, secondary: newSecondary.filter(s => s !== newPrimary) } }]);
+    setNewName(""); setNewTier("B"); setNewPrimary("MID"); setNewSecondary([]);
+  }, [newName, newTier, newPrimary, newSecondary, nextId]);
+
+  const removePlayer = useCallback((id) => {
+    setRoster(prev => prev.filter(p => p.id !== id));
+    setCheckedIn(prev => { const n = new Set(prev); n.delete(id); return n; });
+  }, []);
+
+  const startEdit = useCallback((p) => {
+    setEditingId(p.id); setEditName(p.name); setEditTier(p.tier);
+    setEditPrimary(p.positions.primary); setEditSecondary([...p.positions.secondary]);
+  }, []);
+
+  const saveEdit = useCallback(() => {
+    setRoster(prev => prev.map(p => p.id === editingId ? { ...p, name: editName.trim() || p.name, tier: editTier, positions: { primary: editPrimary, secondary: editSecondary.filter(s => s !== editPrimary) } } : p));
+    setEditingId(null);
+  }, [editingId, editName, editTier, editPrimary, editSecondary]);
+
+  const toggleCheckIn = useCallback((id) => {
+    setCheckedIn(prev => { const n = new Set(prev); if (n.has(id)) n.delete(id); else n.add(id); return n; });
+  }, []);
+  const checkInAll = useCallback(() => setCheckedIn(new Set(roster.map(p => p.id))), [roster]);
+
+  const generateRotation = useCallback(() => {
+    const attendees = roster.filter(p => checkedIn.has(p.id));
+    const result = generateSchedule(attendees, seed);
+    setScheduleData(result);
+    if (!result.error) setScreen("schedule");
+  }, [roster, checkedIn, seed]);
+
+  const reshuffle = useCallback(() => {
+    const newSeed = seed + 1;
+    setSeed(newSeed);
+    const attendees = roster.filter(p => checkedIn.has(p.id));
+    const result = generateSchedule(attendees, newSeed);
+    setScheduleData(result);
+  }, [roster, checkedIn, seed]);
+
+  const S = {
+    app: { minHeight: "100vh", background: "linear-gradient(170deg, #081a0d 0%, #0e2415 50%, #091e10 100%)", color: "#e0f2e0", fontFamily: "system-ui, -apple-system, sans-serif", paddingBottom: 60 },
+    header: { background: "linear-gradient(135deg, rgba(20,70,35,0.95), rgba(10,45,20,0.98))", borderBottom: "1px solid rgba(74,222,128,0.15)", padding: "14px 16px", position: "sticky", top: 0, zIndex: 50, backdropFilter: "blur(12px)" },
+    nav: { display: "flex", gap: 3, marginTop: 10, background: "rgba(0,0,0,0.4)", borderRadius: 8, padding: 3 },
+    navBtn: (a) => ({ flex: 1, padding: "8px 0", border: "none", borderRadius: 6, fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.8, cursor: "pointer", background: a ? "rgba(74,222,128,0.18)" : "transparent", color: a ? "#4ade80" : "rgba(255,255,255,0.35)" }),
+    card: { margin: "10px 12px", padding: "14px", background: "rgba(255,255,255,0.03)", borderRadius: 12, border: "1px solid rgba(255,255,255,0.06)" },
+    input: { width: "100%", padding: "10px 12px", borderRadius: 8, border: "1px solid rgba(255,255,255,0.12)", background: "rgba(0,0,0,0.35)", color: "#e0f2e0", fontSize: 14, outline: "none", boxSizing: "border-box" },
+    rg: { display: "flex", gap: 5, flexWrap: "wrap" },
+    rb: (on) => ({ padding: "6px 13px", borderRadius: 6, border: on ? "1px solid #4ade80" : "1px solid rgba(255,255,255,0.12)", background: on ? "rgba(74,222,128,0.12)" : "rgba(0,0,0,0.25)", color: on ? "#4ade80" : "rgba(255,255,255,0.5)", cursor: "pointer", fontSize: 12, fontWeight: 600 }),
+    cb: (on) => ({ padding: "5px 12px", borderRadius: 6, border: on ? "1px solid #3b82f6" : "1px solid rgba(255,255,255,0.1)", background: on ? "rgba(59,130,246,0.12)" : "rgba(0,0,0,0.2)", color: on ? "#93c5fd" : "rgba(255,255,255,0.45)", cursor: "pointer", fontSize: 12, fontWeight: 500 }),
+    btn: { width: "100%", padding: "12px", borderRadius: 8, border: "none", background: "linear-gradient(135deg, #22c55e, #15803d)", color: "white", fontSize: 14, fontWeight: 700, cursor: "pointer", textTransform: "uppercase", letterSpacing: 0.5 },
+    del: { padding: "4px 10px", borderRadius: 6, border: "1px solid rgba(239,68,68,0.25)", background: "rgba(239,68,68,0.08)", color: "#fca5a5", fontSize: 11, cursor: "pointer", fontWeight: 600 },
+    lbl: { fontSize: 10, fontWeight: 700, color: "rgba(255,255,255,0.35)", textTransform: "uppercase", letterSpacing: 1, marginBottom: 5, display: "block" },
+  };
+
+  // ── ROSTER SCREEN ──
+  const renderRoster = () => (
+    <div>
+      <div style={S.card}>
+        <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 12, color: "#4ade80" }}>Add Player</div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          <div><span style={S.lbl}>Name</span><input style={S.input} value={newName} onChange={e => setNewName(e.target.value)} placeholder="Player name..." onKeyDown={e => e.key === "Enter" && addPlayer()} /></div>
+          <div><span style={S.lbl}>Skill Tier</span><div style={S.rg}>{["A","B","C"].map(t => <button key={t} style={S.rb(newTier===t)} onClick={() => setNewTier(t)}>{t}</button>)}</div></div>
+          <div><span style={S.lbl}>Primary Position</span><div style={S.rg}>{POS_LIST.map(p => <button key={p} style={S.rb(newPrimary===p)} onClick={() => setNewPrimary(p)}>{p}</button>)}</div></div>
+          <div><span style={S.lbl}>Secondary Positions</span><div style={S.rg}>{POS_LIST.filter(p => p !== newPrimary).map(p => (
+            <button key={p} style={S.cb(newSecondary.includes(p))} onClick={() => setNewSecondary(prev => prev.includes(p) ? prev.filter(x => x !== p) : [...prev, p])}>{p}</button>
+          ))}</div></div>
+          <button style={S.btn} onClick={addPlayer}>Add to Roster</button>
+        </div>
+      </div>
+      <div style={S.card}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+          <div style={{ fontSize: 13, fontWeight: 700, color: "#4ade80" }}>Roster ({roster.length})</div>
+          <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+            <span style={{ fontSize: 9, color: "rgba(255,255,255,0.25)" }}>Auto-saved</span>
+            <button onClick={resetRoster} style={{ padding: "4px 8px", borderRadius: 5, border: "1px solid rgba(255,255,255,0.1)", background: "rgba(0,0,0,0.2)", color: "rgba(255,255,255,0.35)", fontSize: 10, cursor: "pointer", fontWeight: 600 }}>Reset Default</button>
+          </div>
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+          {roster.map(player => editingId === player.id ? (
+            <div key={player.id} style={{ padding: 12, background: "rgba(59,130,246,0.06)", borderRadius: 10, border: "1px solid rgba(59,130,246,0.15)" }}>
+              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                <input style={S.input} value={editName} onChange={e => setEditName(e.target.value)} />
+                <div><span style={S.lbl}>Tier</span><div style={S.rg}>{["A","B","C"].map(t => <button key={t} style={S.rb(editTier===t)} onClick={() => setEditTier(t)}>{t}</button>)}</div></div>
+                <div><span style={S.lbl}>Primary</span><div style={S.rg}>{POS_LIST.map(p => <button key={p} style={S.rb(editPrimary===p)} onClick={() => setEditPrimary(p)}>{p}</button>)}</div></div>
+                <div><span style={S.lbl}>Secondary</span><div style={S.rg}>{POS_LIST.filter(p => p !== editPrimary).map(p => (
+                  <button key={p} style={S.cb(editSecondary.includes(p))} onClick={() => setEditSecondary(prev => prev.includes(p) ? prev.filter(x=>x!==p) : [...prev, p])}>{p}</button>
+                ))}</div></div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button style={{ ...S.btn, flex: 1 }} onClick={saveEdit}>Save</button>
+                  <button style={{ ...S.del, padding: "10px 16px" }} onClick={() => setEditingId(null)}>Cancel</button>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <div key={player.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "9px 10px", background: "rgba(0,0,0,0.2)", borderRadius: 8, border: "1px solid rgba(255,255,255,0.04)" }}>
+              <span style={{ width: 22, height: 22, borderRadius: "50%", background: TIER_COLORS[player.tier], display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, fontWeight: 800, color: "white", flexShrink: 0 }}>{player.tier}</span>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 13, fontWeight: 600 }}>{player.name}</div>
+                <div style={{ fontSize: 10, color: "rgba(255,255,255,0.35)" }}>{player.positions.primary}{player.positions.secondary.length > 0 && ` · ${player.positions.secondary.join(", ")}`}</div>
+              </div>
+              <button style={{ padding: "4px 10px", borderRadius: 6, border: "1px solid rgba(255,255,255,0.1)", background: "rgba(255,255,255,0.04)", color: "rgba(255,255,255,0.45)", fontSize: 11, cursor: "pointer" }} onClick={() => startEdit(player)}>Edit</button>
+              <button style={S.del} onClick={() => removePlayer(player.id)}>✕</button>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+
+  // ── GAME DAY SCREEN ──
+  const renderGameDay = () => {
+    const cc = checkedIn.size;
+    const hasGk = roster.some(p => checkedIn.has(p.id) && (p.positions.primary === "GK" || p.positions.secondary.includes("GK")));
+    const ready = cc >= 9 && hasGk;
+
+    return (
+      <div>
+        <div style={S.card}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+            <div style={{ fontSize: 13, fontWeight: 700, color: "#4ade80" }}>Check-In ({cc}/{roster.length})</div>
+            <button onClick={checkInAll} style={{ padding: "5px 12px", borderRadius: 6, border: "1px solid rgba(74,222,128,0.25)", background: "rgba(74,222,128,0.08)", color: "#4ade80", fontSize: 11, fontWeight: 600, cursor: "pointer" }}>All Present</button>
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+            {roster.map(player => {
+              const on = checkedIn.has(player.id);
+              return (
+                <button key={player.id} onClick={() => toggleCheckIn(player.id)} style={{ display: "flex", alignItems: "center", gap: 8, padding: "9px 10px", borderRadius: 8, border: on ? "1px solid rgba(74,222,128,0.25)" : "1px solid rgba(255,255,255,0.04)", background: on ? "rgba(74,222,128,0.06)" : "rgba(0,0,0,0.2)", cursor: "pointer", width: "100%", textAlign: "left" }}>
+                  <span style={{ width: 18, height: 18, borderRadius: 4, border: on ? "2px solid #4ade80" : "2px solid rgba(255,255,255,0.18)", background: on ? "#4ade80" : "transparent", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, color: on ? "#081a0d" : "transparent", fontWeight: 800, flexShrink: 0 }}>✓</span>
+                  <span style={{ width: 20, height: 20, borderRadius: "50%", background: TIER_COLORS[player.tier], display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, fontWeight: 800, color: "white", flexShrink: 0 }}>{player.tier}</span>
+                  <span style={{ fontSize: 13, fontWeight: 600, color: "#e0f2e0", flex: 1 }}>{player.name}</span>
+                  <span style={{ fontSize: 10, color: "rgba(255,255,255,0.3)" }}>{player.positions.primary}</span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+        <div style={S.card}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {!hasGk && cc > 0 && <div style={{ padding: "8px 10px", borderRadius: 8, background: "rgba(239,68,68,0.08)", border: "1px solid rgba(239,68,68,0.15)", fontSize: 12, color: "#fca5a5" }}>⚠ No GK-eligible player checked in</div>}
+            {cc < 9 && cc > 0 && <div style={{ padding: "8px 10px", borderRadius: 8, background: "rgba(245,158,11,0.08)", border: "1px solid rgba(245,158,11,0.15)", fontSize: 12, color: "#fcd34d" }}>Need ≥ 9 players ({cc} checked)</div>}
+            {scheduleData?.error && <div style={{ padding: "8px 10px", borderRadius: 8, background: "rgba(239,68,68,0.08)", border: "1px solid rgba(239,68,68,0.15)", fontSize: 12, color: "#fca5a5" }}>{scheduleData.error}</div>}
+            <button style={{ ...S.btn, opacity: ready ? 1 : 0.35, cursor: ready ? "pointer" : "not-allowed" }} onClick={generateRotation} disabled={!ready}>Generate Rotation</button>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  // ── SCHEDULE SCREEN ──
+  const renderSchedule = () => {
+    if (!scheduleData || scheduleData.error) {
+      return <div style={S.card}><div style={{ textAlign: "center", color: "rgba(255,255,255,0.35)", padding: 20, fontSize: 13 }}>No schedule generated yet.</div></div>;
+    }
+
+    const { slots, summary } = scheduleData;
+    const avg = summary.length > 0 ? summary.reduce((s, p) => s + p.slotsPlayed, 0) / summary.length : 0;
+    const minS = Math.min(...summary.map(p => p.slotsPlayed));
+    const maxS = Math.max(...summary.map(p => p.slotsPlayed));
+
+    // Timer calculations
+    const totalGameSeconds = 50 * 60; // 50 min game
+    const currentSlot = Math.min(Math.floor(timerSeconds / 300), 9); // 300s = 5 min
+    const slotElapsed = timerSeconds % 300;
+    const slotRemaining = 300 - slotElapsed;
+    const isHalf = timerSeconds >= 25 * 60;
+    const displayMin = Math.floor(timerSeconds / 60);
+    const displaySec = timerSeconds % 60;
+    const nextSubIn = slotRemaining;
+    const nextSubMin = Math.floor(nextSubIn / 60);
+    const nextSubSec = nextSubIn % 60;
+    const gameOver = timerSeconds >= totalGameSeconds;
+
+    return (
+      <div>
+        {/* Reshuffle + Legend */}
+        <div style={{ ...S.card, display: "flex", gap: 12, flexWrap: "wrap", padding: "8px 14px", alignItems: "center", justifyContent: "space-between" }}>
+          <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+            <span style={{ fontSize: 10, display: "flex", alignItems: "center", gap: 4 }}>
+              <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#4ade80" }} /><span style={{ color: "rgba(255,255,255,0.45)" }}>ON</span>
+            </span>
+            <span style={{ fontSize: 10, display: "flex", alignItems: "center", gap: 4 }}>
+              <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#fbbf24" }} /><span style={{ color: "rgba(255,255,255,0.45)" }}>OFF</span>
+            </span>
+            <span style={{ fontSize: 10, color: "rgba(255,255,255,0.25)" }}>|</span>
+            {["A","B","C"].map(t => (
+              <span key={t} style={{ fontSize: 10, display: "flex", alignItems: "center", gap: 3 }}>
+                <span style={{ width: 12, height: 12, borderRadius: "50%", background: TIER_COLORS[t], display: "flex", alignItems: "center", justifyContent: "center", fontSize: 8, fontWeight: 800, color: "white" }}>{t}</span>
+              </span>
+            ))}
+          </div>
+          <button onClick={reshuffle} style={{
+            padding: "5px 10px", borderRadius: 6, fontSize: 10, fontWeight: 700,
+            border: "1px solid rgba(59,130,246,0.3)", background: "rgba(59,130,246,0.1)",
+            color: "#93c5fd", cursor: "pointer", textTransform: "uppercase", letterSpacing: 0.5
+          }}>↻ Reshuffle</button>
+        </div>
+
+        {slots.map(slot => (
+          <div key={slot.slotIndex} style={S.card}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span style={{ fontSize: 20, fontWeight: 800, color: "#4ade80", fontFamily: "monospace", letterSpacing: -1 }}>{slot.time}</span>
+                {slot.label && <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 7px", borderRadius: 4, background: slot.label === "2nd Half" ? "rgba(59,130,246,0.15)" : "rgba(74,222,128,0.12)", color: slot.label === "2nd Half" ? "#93c5fd" : "#86efac" }}>{slot.label}</span>}
+                {slot.gkChanged && <span style={{ fontSize: 9, fontWeight: 600, padding: "2px 6px", borderRadius: 4, background: "rgba(96,165,250,0.15)", color: "#93c5fd" }}>GK swap</span>}
+                {slot.cCount > 1 && <span style={{ fontSize: 9, fontWeight: 600, padding: "2px 6px", borderRadius: 4, background: "rgba(245,158,11,0.12)", color: "#fbbf24" }}>{slot.cCount}× C</span>}
+              </div>
+              <span style={{ fontSize: 10, color: "rgba(255,255,255,0.25)", fontWeight: 600 }}>{slot.slotIndex + 1}/10</span>
+            </div>
+
+            {slot.slotIndex > 0 && (slot.comingOn.length > 0 || slot.comingOff.length > 0) && (
+              <div style={{ marginBottom: 8, display: "flex", gap: 6, flexWrap: "wrap" }}>
+                {slot.comingOn.length > 0 && <div style={{ fontSize: 11, padding: "3px 8px", borderRadius: 5, background: "rgba(74,222,128,0.08)", border: "1px solid rgba(74,222,128,0.15)", color: "#86efac" }}>▲ {slot.comingOn.map(p => p.name).join(", ")}</div>}
+                {slot.comingOff.length > 0 && <div style={{ fontSize: 11, padding: "3px 8px", borderRadius: 5, background: "rgba(251,191,36,0.08)", border: "1px solid rgba(251,191,36,0.15)", color: "#fde68a" }}>▼ {slot.comingOff.map(p => p.name).join(", ")}</div>}
+              </div>
+            )}
+
+            <FieldGraphic slot={slot} />
+          </div>
+        ))}
+
+        {/* Summary */}
+        <div style={S.card}>
+          <div style={{ fontSize: 13, fontWeight: 700, color: "#4ade80", marginBottom: 10 }}>Playing Time Summary</div>
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
+              <thead>
+                <tr style={{ borderBottom: "1px solid rgba(255,255,255,0.08)" }}>
+                  {["Player","Tier","On Pitch","GK","Field","Min","Positions"].map(h => (
+                    <th key={h} style={{ textAlign: h==="Player"||h==="Positions" ? "left" : "center", padding: "6px 4px", color: "rgba(255,255,255,0.3)", fontWeight: 600, fontSize: 9, textTransform: "uppercase", letterSpacing: 0.5 }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {[...summary].sort((a,b) => b.totalMinutes - a.totalMinutes || a.name.localeCompare(b.name)).map(p => {
+                  let bg = "transparent";
+                  if (p.slotsPlayed > avg + 1) bg = "rgba(245,158,11,0.1)";
+                  if (p.slotsPlayed < avg - 1) bg = "rgba(239,68,68,0.1)";
+                  return (
+                    <tr key={p.id} style={{ borderBottom: "1px solid rgba(255,255,255,0.04)", background: bg }}>
+                      <td style={{ padding: "7px 4px", fontWeight: 600, fontSize: 12 }}>{p.name}</td>
+                      <td style={{ padding: "7px 3px", textAlign: "center" }}>
+                        <span style={{ display: "inline-block", width: 16, height: 16, borderRadius: "50%", background: TIER_COLORS[p.tier], lineHeight: "16px", fontSize: 9, fontWeight: 800, color: "white", textAlign: "center" }}>{p.tier}</span>
+                      </td>
+                      <td style={{ padding: "7px 3px", textAlign: "center", fontWeight: 700, fontFamily: "monospace", fontSize: 13 }}>{p.slotsPlayed}</td>
+                      <td style={{ padding: "7px 3px", textAlign: "center", fontFamily: "monospace", fontSize: 11, color: p.gkSlots > 0 ? "#5b9bd5" : "rgba(255,255,255,0.2)" }}>{p.gkSlots || "—"}</td>
+                      <td style={{ padding: "7px 3px", textAlign: "center", fontFamily: "monospace", fontSize: 11 }}>{p.fieldSlots}</td>
+                      <td style={{ padding: "7px 3px", textAlign: "center", fontFamily: "monospace" }}>{p.totalMinutes}</td>
+                      <td style={{ padding: "7px 4px", color: "rgba(255,255,255,0.45)", fontSize: 10 }}>{p.positionsUsed.join(", ") || "—"}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          <div style={{ marginTop: 10, padding: "6px 10px", background: "rgba(0,0,0,0.2)", borderRadius: 6, fontSize: 10, color: "rgba(255,255,255,0.35)", display: "flex", gap: 12, flexWrap: "wrap" }}>
+            <span>Avg: {avg.toFixed(1)}</span>
+            <span>Range: {minS}–{maxS}</span>
+            <span><span style={{ color: "rgba(239,68,68,0.5)" }}>■</span> &lt;avg-1</span>
+            <span><span style={{ color: "rgba(245,158,11,0.5)" }}>■</span> &gt;avg+1</span>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <div style={S.app}>
+      <div style={S.header}>
+        <h1 style={{ fontSize: 18, fontWeight: 800, margin: 0, color: "#4ade80", letterSpacing: -0.3 }}>⚽ Pitch Manager</h1>
+        <div style={S.nav}>
+          <button style={S.navBtn(screen==="roster")} onClick={() => setScreen("roster")}>Roster</button>
+          <button style={S.navBtn(screen==="gameday")} onClick={() => setScreen("gameday")}>Game Day</button>
+          <button style={S.navBtn(screen==="schedule")} onClick={() => setScreen("schedule")}>Schedule</button>
+        </div>
+      </div>
+      <div style={{ maxWidth: 480, margin: "0 auto" }}>
+        {screen === "roster" && renderRoster()}
+        {screen === "gameday" && renderGameDay()}
+        {screen === "schedule" && renderSchedule()}
+      </div>
+    </div>
+  );
+}
+
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(React.createElement(SoccerApp));
+  </script>
+</body>
+</html>
