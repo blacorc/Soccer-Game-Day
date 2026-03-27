@@ -15,8 +15,17 @@
 </head>
 <body>
   <div id="root"></div>
+  <script>
+    // Global error handler - shows errors instead of white screen
+    window.onerror = function(msg, src, line, col, err) {
+      document.getElementById('root').innerHTML =
+        '<div style="padding:20px;color:#fca5a5;background:#1a0a0a;font-family:monospace;font-size:13px;white-space:pre-wrap">' +
+        '<h3 style="color:#f87171;margin-bottom:10px">⚠ Error</h3>' +
+        msg + '\n\nLine: ' + line + '\n' + (err ? err.stack : '') + '</div>';
+    };
+  </script>
   <script type="text/babel">
-    const { useState, useMemo, useCallback } = React;
+    const { useState, useMemo, useCallback, useEffect } = React;
 
 /*
  * ============================================================
@@ -736,28 +745,26 @@ function FieldGraphic({ slot }) {
     const cx = (coord.x / 100) * 300;
     const cy = (coord.y / 100) * 420;
 
-    let border = "rgba(255,255,255,0.45)";
+    // High contrast colors for outdoor viewing
+    let border = TIER_COLORS[player.tier]; // tier shown as ring color only
     let glow = "none";
-    let bg = "rgba(8,24,12,0.88)";
+    let bg = "#0a1f10";
 
-    if (isGoalkeeper) { bg = "#1a3d5c"; border = "#5b9bd5"; }
-    if (isSubOn) { border = "#4ade80"; glow = "rgba(74,222,128,0.3)"; if (!isGoalkeeper) bg = "rgba(22,101,52,0.85)"; }
-    if (isSubOff) { border = "#fbbf24"; glow = "rgba(251,191,36,0.25)"; bg = "rgba(120,80,0,0.55)"; }
+    if (isGoalkeeper) { bg = "#0f2a4a"; border = "#60a5fa"; }
+    if (isSubOn) { glow = "rgba(74,222,128,0.4)"; bg = "#0f3d1f"; }
+    if (isSubOff) { glow = "rgba(251,191,36,0.35)"; bg = "#3d2e05"; }
 
     const nm = player.name.length > 7 ? player.name.slice(0, 6) + "…" : player.name;
 
     return (
       <g key={`${player.id}-${pos}-${cx}`}>
-        {glow !== "none" && <circle cx={cx} cy={cy} r="28" fill={glow} />}
-        <circle cx={cx} cy={cy} r="20" fill={bg} stroke={border} strokeWidth="2" />
+        {glow !== "none" && <circle cx={cx} cy={cy} r="30" fill={glow} />}
+        <circle cx={cx} cy={cy} r="21" fill={bg} stroke={border} strokeWidth="3" />
         <text x={cx} y={cy + 1} textAnchor="middle" dominantBaseline="middle"
-          fontSize="9" fontWeight="700" fill="white" fontFamily="system-ui">{nm}</text>
-        <circle cx={cx + 15} cy={cy - 14} r="7" fill={TIER_COLORS[player.tier]} />
-        <text x={cx + 15} y={cy - 13.5} textAnchor="middle" dominantBaseline="middle"
-          fontSize="8" fontWeight="800" fill="white">{player.tier}</text>
-        <rect x={cx - 12} y={cy + 23} width="24" height="12" rx="3" fill="rgba(0,0,0,0.5)" />
-        <text x={cx} y={cy + 29.5} textAnchor="middle" dominantBaseline="middle"
-          fontSize="7" fill="rgba(255,255,255,0.6)" fontWeight="600">{pos}</text>
+          fontSize="10" fontWeight="800" fill="white" fontFamily="system-ui">{nm}</text>
+        <rect x={cx - 12} y={cy + 24} width="24" height="13" rx="3" fill="rgba(0,0,0,0.7)" />
+        <text x={cx} y={cy + 31} textAnchor="middle" dominantBaseline="middle"
+          fontSize="8" fill="white" fontWeight="700">{pos}</text>
       </g>
     );
   };
@@ -767,32 +774,32 @@ function FieldGraphic({ slot }) {
       <svg viewBox="0 0 300 420" style={{ width: "100%", height: "auto", display: "block" }}>
         <defs>
           <linearGradient id="pitch" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stopColor="#1a6b30" />
-            <stop offset="50%" stopColor="#187028" />
-            <stop offset="100%" stopColor="#1a6b30" />
+            <stop offset="0%" stopColor="#145524" />
+            <stop offset="50%" stopColor="#12491e" />
+            <stop offset="100%" stopColor="#145524" />
           </linearGradient>
         </defs>
         <rect x="0" y="0" width="300" height="420" rx="10" fill="url(#pitch)" />
         {[0,1,2,3,4,5,6].map(i => (
           <rect key={i} x="0" y={i*60} width="300" height="30" fill="rgba(255,255,255,0.02)" />
         ))}
-        <rect x="12" y="12" width="276" height="396" rx="4" fill="none" stroke="rgba(255,255,255,0.3)" strokeWidth="1.5" />
-        <line x1="12" y1="210" x2="288" y2="210" stroke="rgba(255,255,255,0.3)" strokeWidth="1.5" />
-        <circle cx="150" cy="210" r="36" fill="none" stroke="rgba(255,255,255,0.2)" strokeWidth="1.2" />
+        <rect x="12" y="12" width="276" height="396" rx="4" fill="none" stroke="rgba(255,255,255,0.45)" strokeWidth="2" />
+        <line x1="12" y1="210" x2="288" y2="210" stroke="rgba(255,255,255,0.45)" strokeWidth="2" />
+        <circle cx="150" cy="210" r="36" fill="none" stroke="rgba(255,255,255,0.3)" strokeWidth="1.5" />
         <circle cx="150" cy="210" r="3" fill="rgba(255,255,255,0.3)" />
-        <rect x="72" y="12" width="156" height="65" fill="none" stroke="rgba(255,255,255,0.2)" strokeWidth="1" />
-        <rect x="108" y="12" width="84" height="28" fill="none" stroke="rgba(255,255,255,0.15)" strokeWidth="1" />
-        <rect x="72" y="343" width="156" height="65" fill="none" stroke="rgba(255,255,255,0.2)" strokeWidth="1" />
-        <rect x="108" y="380" width="84" height="28" fill="none" stroke="rgba(255,255,255,0.15)" strokeWidth="1" />
-        <path d="M12,22 A10,10 0 0,1 22,12" fill="none" stroke="rgba(255,255,255,0.15)" strokeWidth="1" />
-        <path d="M278,12 A10,10 0 0,1 288,22" fill="none" stroke="rgba(255,255,255,0.15)" strokeWidth="1" />
-        <path d="M12,398 A10,10 0 0,0 22,408" fill="none" stroke="rgba(255,255,255,0.15)" strokeWidth="1" />
-        <path d="M278,408 A10,10 0 0,0 288,398" fill="none" stroke="rgba(255,255,255,0.15)" strokeWidth="1" />
+        <rect x="72" y="12" width="156" height="65" fill="none" stroke="rgba(255,255,255,0.3)" strokeWidth="1.2" />
+        <rect x="108" y="12" width="84" height="28" fill="none" stroke="rgba(255,255,255,0.25)" strokeWidth="1" />
+        <rect x="72" y="343" width="156" height="65" fill="none" stroke="rgba(255,255,255,0.3)" strokeWidth="1.2" />
+        <rect x="108" y="380" width="84" height="28" fill="none" stroke="rgba(255,255,255,0.25)" strokeWidth="1" />
+        <path d="M12,22 A10,10 0 0,1 22,12" fill="none" stroke="rgba(255,255,255,0.25)" strokeWidth="1" />
+        <path d="M278,12 A10,10 0 0,1 288,22" fill="none" stroke="rgba(255,255,255,0.25)" strokeWidth="1" />
+        <path d="M12,398 A10,10 0 0,0 22,408" fill="none" stroke="rgba(255,255,255,0.25)" strokeWidth="1" />
+        <path d="M278,408 A10,10 0 0,0 288,398" fill="none" stroke="rgba(255,255,255,0.25)" strokeWidth="1" />
 
-        <text x="150" y="100" textAnchor="middle" fontSize="16" fill="rgba(255,255,255,0.06)" fontWeight="900">FWD</text>
-        <text x="150" y="208" textAnchor="middle" fontSize="16" fill="rgba(255,255,255,0.06)" fontWeight="900">MID</text>
-        <text x="150" y="316" textAnchor="middle" fontSize="16" fill="rgba(255,255,255,0.06)" fontWeight="900">DEF</text>
-        <text x="150" y="400" textAnchor="middle" fontSize="14" fill="rgba(255,255,255,0.06)" fontWeight="900">GK</text>
+        <text x="150" y="100" textAnchor="middle" fontSize="16" fill="rgba(255,255,255,0.1)" fontWeight="900">FWD</text>
+        <text x="150" y="208" textAnchor="middle" fontSize="16" fill="rgba(255,255,255,0.1)" fontWeight="900">MID</text>
+        <text x="150" y="316" textAnchor="middle" fontSize="16" fill="rgba(255,255,255,0.1)" fontWeight="900">DEF</text>
+        <text x="150" y="400" textAnchor="middle" fontSize="14" fill="rgba(255,255,255,0.1)" fontWeight="900">GK</text>
 
         {nodes.map(renderNode)}
       </svg>
@@ -803,11 +810,11 @@ function FieldGraphic({ slot }) {
         </div>
         <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
           {bench.map(p => (
-            <span key={p.id} style={{ fontSize: 11, padding: "3px 8px", borderRadius: 5, background: TIER_BG[p.tier], color: "rgba(255,255,255,0.75)", border: `1px solid ${TIER_COLORS[p.tier]}30`, fontWeight: 500 }}>
-              {p.name}<span style={{ fontSize: 9, marginLeft: 3, color: TIER_COLORS[p.tier], fontWeight: 700 }}>{p.tier}</span>
+            <span key={p.id} style={{ fontSize: 12, padding: "4px 10px", borderRadius: 6, background: "rgba(0,0,0,0.5)", color: "white", borderLeft: `3px solid ${TIER_COLORS[p.tier]}`, fontWeight: 600 }}>
+              {p.name}
             </span>
           ))}
-          {bench.length === 0 && <span style={{ fontSize: 11, color: "rgba(255,255,255,0.3)", fontStyle: "italic" }}>None</span>}
+          {bench.length === 0 && <span style={{ fontSize: 12, color: "rgba(255,255,255,0.4)", fontStyle: "italic" }}>None</span>}
         </div>
       </div>
     </div>
@@ -831,7 +838,7 @@ function SoccerApp() {
   const [roster, setRoster] = useState(() => loadRoster() || DEFAULT_ROSTER);
 
   // Save roster whenever it changes
-  React.useEffect(() => {
+  useEffect(() => {
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(roster));
     } catch (e) {}
@@ -839,7 +846,7 @@ function SoccerApp() {
 
   const resetRoster = useCallback(() => {
     setRoster(DEFAULT_ROSTER);
-    localStorage.removeItem(STORAGE_KEY);
+    try { localStorage.removeItem(STORAGE_KEY); } catch(e) {}
   }, []);
   const [editingId, setEditingId] = useState(null);
   const [checkedIn, setCheckedIn] = useState(new Set());
@@ -899,12 +906,12 @@ function SoccerApp() {
   }, [roster, checkedIn, seed]);
 
   const S = {
-    app: { minHeight: "100vh", background: "linear-gradient(170deg, #081a0d 0%, #0e2415 50%, #091e10 100%)", color: "#e0f2e0", fontFamily: "system-ui, -apple-system, sans-serif", paddingBottom: 60 },
-    header: { background: "linear-gradient(135deg, rgba(20,70,35,0.95), rgba(10,45,20,0.98))", borderBottom: "1px solid rgba(74,222,128,0.15)", padding: "14px 16px", position: "sticky", top: 0, zIndex: 50, backdropFilter: "blur(12px)" },
+    app: { minHeight: "100vh", background: "#050f08", color: "#f0f9f0", fontFamily: "system-ui, -apple-system, sans-serif", paddingBottom: 60 },
+    header: { background: "#0a2010", borderBottom: "2px solid rgba(74,222,128,0.25)", padding: "14px 16px", position: "sticky", top: 0, zIndex: 50 },
     nav: { display: "flex", gap: 3, marginTop: 10, background: "rgba(0,0,0,0.4)", borderRadius: 8, padding: 3 },
     navBtn: (a) => ({ flex: 1, padding: "8px 0", border: "none", borderRadius: 6, fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.8, cursor: "pointer", background: a ? "rgba(74,222,128,0.18)" : "transparent", color: a ? "#4ade80" : "rgba(255,255,255,0.35)" }),
-    card: { margin: "10px 12px", padding: "14px", background: "rgba(255,255,255,0.03)", borderRadius: 12, border: "1px solid rgba(255,255,255,0.06)" },
-    input: { width: "100%", padding: "10px 12px", borderRadius: 8, border: "1px solid rgba(255,255,255,0.12)", background: "rgba(0,0,0,0.35)", color: "#e0f2e0", fontSize: 14, outline: "none", boxSizing: "border-box" },
+    card: { margin: "10px 12px", padding: "14px", background: "rgba(255,255,255,0.05)", borderRadius: 12, border: "1px solid rgba(255,255,255,0.1)" },
+    input: { width: "100%", padding: "10px 12px", borderRadius: 8, border: "1px solid rgba(255,255,255,0.2)", background: "rgba(0,0,0,0.5)", color: "white", fontSize: 15, outline: "none", boxSizing: "border-box" },
     rg: { display: "flex", gap: 5, flexWrap: "wrap" },
     rb: (on) => ({ padding: "6px 13px", borderRadius: 6, border: on ? "1px solid #4ade80" : "1px solid rgba(255,255,255,0.12)", background: on ? "rgba(74,222,128,0.12)" : "rgba(0,0,0,0.25)", color: on ? "#4ade80" : "rgba(255,255,255,0.5)", cursor: "pointer", fontSize: 12, fontWeight: 600 }),
     cb: (on) => ({ padding: "5px 12px", borderRadius: 6, border: on ? "1px solid #3b82f6" : "1px solid rgba(255,255,255,0.1)", background: on ? "rgba(59,130,246,0.12)" : "rgba(0,0,0,0.2)", color: on ? "#93c5fd" : "rgba(255,255,255,0.45)", cursor: "pointer", fontSize: 12, fontWeight: 500 }),
@@ -1021,24 +1028,18 @@ function SoccerApp() {
     return (
       <div>
         {/* Reshuffle + Legend */}
-        <div style={{ ...S.card, display: "flex", gap: 12, flexWrap: "wrap", padding: "8px 14px", alignItems: "center", justifyContent: "space-between" }}>
-          <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
-            <span style={{ fontSize: 10, display: "flex", alignItems: "center", gap: 4 }}>
-              <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#4ade80" }} /><span style={{ color: "rgba(255,255,255,0.45)" }}>ON</span>
+        <div style={{ ...S.card, display: "flex", flexWrap: "wrap", padding: "8px 14px", alignItems: "center", justifyContent: "space-between" }}>
+          <div style={{ display: "flex", gap: 14, alignItems: "center" }}>
+            <span style={{ fontSize: 12, display: "flex", alignItems: "center", gap: 5 }}>
+              <span style={{ width: 10, height: 10, borderRadius: "50%", background: "#4ade80" }} /><span style={{ color: "rgba(255,255,255,0.7)", fontWeight: 600 }}>ON</span>
             </span>
-            <span style={{ fontSize: 10, display: "flex", alignItems: "center", gap: 4 }}>
-              <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#fbbf24" }} /><span style={{ color: "rgba(255,255,255,0.45)" }}>OFF</span>
+            <span style={{ fontSize: 12, display: "flex", alignItems: "center", gap: 5 }}>
+              <span style={{ width: 10, height: 10, borderRadius: "50%", background: "#fbbf24" }} /><span style={{ color: "rgba(255,255,255,0.7)", fontWeight: 600 }}>OFF</span>
             </span>
-            <span style={{ fontSize: 10, color: "rgba(255,255,255,0.25)" }}>|</span>
-            {["A","B","C"].map(t => (
-              <span key={t} style={{ fontSize: 10, display: "flex", alignItems: "center", gap: 3 }}>
-                <span style={{ width: 12, height: 12, borderRadius: "50%", background: TIER_COLORS[t], display: "flex", alignItems: "center", justifyContent: "center", fontSize: 8, fontWeight: 800, color: "white" }}>{t}</span>
-              </span>
-            ))}
           </div>
           <button onClick={reshuffle} style={{
-            padding: "5px 10px", borderRadius: 6, fontSize: 10, fontWeight: 700,
-            border: "1px solid rgba(59,130,246,0.3)", background: "rgba(59,130,246,0.1)",
+            padding: "6px 12px", borderRadius: 6, fontSize: 11, fontWeight: 700,
+            border: "1px solid rgba(96,165,250,0.4)", background: "rgba(59,130,246,0.15)",
             color: "#93c5fd", cursor: "pointer", textTransform: "uppercase", letterSpacing: 0.5
           }}>↻ Reshuffle</button>
         </div>
@@ -1047,18 +1048,18 @@ function SoccerApp() {
           <div key={slot.slotIndex} style={S.card}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
               <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <span style={{ fontSize: 20, fontWeight: 800, color: "#4ade80", fontFamily: "monospace", letterSpacing: -1 }}>{slot.time}</span>
-                {slot.label && <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 7px", borderRadius: 4, background: slot.label === "2nd Half" ? "rgba(59,130,246,0.15)" : "rgba(74,222,128,0.12)", color: slot.label === "2nd Half" ? "#93c5fd" : "#86efac" }}>{slot.label}</span>}
-                {slot.gkChanged && <span style={{ fontSize: 9, fontWeight: 600, padding: "2px 6px", borderRadius: 4, background: "rgba(96,165,250,0.15)", color: "#93c5fd" }}>GK swap</span>}
-                {slot.cCount > 1 && <span style={{ fontSize: 9, fontWeight: 600, padding: "2px 6px", borderRadius: 4, background: "rgba(245,158,11,0.12)", color: "#fbbf24" }}>{slot.cCount}× C</span>}
+                <span style={{ fontSize: 22, fontWeight: 900, color: "white", fontFamily: "monospace", letterSpacing: -1 }}>{slot.time}</span>
+                {slot.label && <span style={{ fontSize: 11, fontWeight: 700, padding: "3px 8px", borderRadius: 4, background: slot.label === "2nd Half" ? "rgba(59,130,246,0.2)" : "rgba(74,222,128,0.15)", color: slot.label === "2nd Half" ? "#93c5fd" : "#86efac" }}>{slot.label}</span>}
+                {slot.gkChanged && <span style={{ fontSize: 10, fontWeight: 700, padding: "3px 7px", borderRadius: 4, background: "rgba(96,165,250,0.2)", color: "#93c5fd" }}>GK swap</span>}
+                {slot.cCount > 1 && <span style={{ fontSize: 10, fontWeight: 700, padding: "3px 7px", borderRadius: 4, background: "rgba(245,158,11,0.15)", color: "#fbbf24" }}>{slot.cCount}× C</span>}
               </div>
-              <span style={{ fontSize: 10, color: "rgba(255,255,255,0.25)", fontWeight: 600 }}>{slot.slotIndex + 1}/10</span>
+              <span style={{ fontSize: 11, color: "rgba(255,255,255,0.4)", fontWeight: 700 }}>{slot.slotIndex + 1}/10</span>
             </div>
 
             {slot.slotIndex > 0 && (slot.comingOn.length > 0 || slot.comingOff.length > 0) && (
               <div style={{ marginBottom: 8, display: "flex", gap: 6, flexWrap: "wrap" }}>
-                {slot.comingOn.length > 0 && <div style={{ fontSize: 11, padding: "3px 8px", borderRadius: 5, background: "rgba(74,222,128,0.08)", border: "1px solid rgba(74,222,128,0.15)", color: "#86efac" }}>▲ {slot.comingOn.map(p => p.name).join(", ")}</div>}
-                {slot.comingOff.length > 0 && <div style={{ fontSize: 11, padding: "3px 8px", borderRadius: 5, background: "rgba(251,191,36,0.08)", border: "1px solid rgba(251,191,36,0.15)", color: "#fde68a" }}>▼ {slot.comingOff.map(p => p.name).join(", ")}</div>}
+                {slot.comingOn.length > 0 && <div style={{ fontSize: 13, padding: "4px 10px", borderRadius: 6, background: "rgba(74,222,128,0.12)", border: "1px solid rgba(74,222,128,0.25)", color: "#86efac", fontWeight: 600 }}>▲ {slot.comingOn.map(p => p.name).join(", ")}</div>}
+                {slot.comingOff.length > 0 && <div style={{ fontSize: 13, padding: "4px 10px", borderRadius: 6, background: "rgba(251,191,36,0.12)", border: "1px solid rgba(251,191,36,0.25)", color: "#fde68a", fontWeight: 600 }}>▼ {slot.comingOff.map(p => p.name).join(", ")}</div>}
               </div>
             )}
 
