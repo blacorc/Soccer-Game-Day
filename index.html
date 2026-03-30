@@ -153,7 +153,7 @@ function assignFieldPositions(fieldPlayers) {
 
 // ─── MAIN SCHEDULE GENERATOR ─────────────────────────────────
 
-function generateSchedule(attendees, seed = 0) {
+function generateSchedule(attendees, seed = 0, selectedGoalies = null) {
   try {
   // Seeded shuffle utility for re-optimize
   const seededRandom = (s) => {
@@ -190,18 +190,20 @@ function generateSchedule(attendees, seed = 0) {
   // ── PHASE 1: Assign GK per slot ──
   const gkSchedule = new Array(SLOTS).fill(null); // player object per slot
 
-  if (primaryGK) {
-    // One GK per half, no mid-half swaps.
-    // Tuck plays full 1st half (slots 0-4, 25 min).
-    // One secondary GK plays full 2nd half (slots 5-9, 25 min).
-    // Tuck moves to field (DEF) in the 2nd half.
-    const sec1 = secondaryGKs[0] || primaryGK; // fallback if no secondaries
-
+  if (selectedGoalies && selectedGoalies.firstHalf && selectedGoalies.secondHalf) {
+    // Use manually selected goalies
+    const gk1 = ALL.find(p => p.id === selectedGoalies.firstHalf);
+    const gk2 = ALL.find(p => p.id === selectedGoalies.secondHalf);
+    if (!gk1 || !gk2) return { error: "Selected goalkeepers not found in attendees", slots: [], summary: [] };
+    for (let s = 0; s < SLOTS; s++) {
+      gkSchedule[s] = s < 5 ? gk1 : gk2;
+    }
+  } else if (primaryGK) {
+    const sec1 = secondaryGKs[0] || primaryGK;
     for (let s = 0; s < SLOTS; s++) {
       gkSchedule[s] = s < 5 ? primaryGK : sec1;
     }
   } else {
-    // No primary GK — split halves between two secondary GKs.
     const gk1 = gkEligible[0];
     const gk2 = gkEligible.length > 1 ? gkEligible[1] : gkEligible[0];
     for (let s = 0; s < SLOTS; s++) {
@@ -702,6 +704,332 @@ function generateSchedule(attendees, seed = 0) {
   }
 }
 
+// ─── MANUAL SUB + REGENERATION ──────────────────────────────
+function applyManualSubAndRegenerate(currentSchedule, attendees, slotIndex, playerOffId, playerOnId, selectedGoalies) {
+  try {
+  const ALL = [...attendees];
+  const N = ALL.length;
+  const SLOTS = 10;
+  const ON_PITCH = 9;
+  const FIELD_SPOTS = 8;
+  const SUBS = 3;
+
+  const playerIdx = {};
+  ALL.forEach((p, i) => { playerIdx[p.id] = i; });
+  const cIds = new Set(ALL.filter(p => p.tier === "C").map(p => p.id));
+
+  // GK schedule
+  const gkSchedule = new Array(SLOTS).fill(null);
+  if (selectedGoalies && selectedGoalies.firstHalf && selectedGoalies.secondHalf) {
+    const gk1 = ALL.find(p => p.id === selectedGoalies.firstHalf);
+    const gk2 = ALL.find(p => p.id === selectedGoalies.secondHalf);
+    for (let s = 0; s < SLOTS; s++) gkSchedule[s] = s < 5 ? gk1 : gk2;
+  } else {
+    for (let s = 0; s < SLOTS; s++) gkSchedule[s] = currentSchedule.slots[s].gk;
+  }
+
+  // Build grid from locked slots (0..slotIndex-1) and apply manual sub at slotIndex
+  const grid = ALL.map(() => new Array(SLOTS).fill(null));
+
+  // Copy locked slots (before the manual sub slot)
+  for (let s = 0; s < slotIndex; s++) {
+    const slot = currentSchedule.slots[s];
+    grid[playerIdx[slot.gk.id]][s] = "GK";
+    for (const p of slot.onField) grid[playerIdx[p.id]][s] = "FIELD";
+  }
+
+  // Apply manual sub at slotIndex
+  const subSlot = currentSchedule.slots[slotIndex];
+  grid[playerIdx[subSlot.gk.id]][slotIndex] = "GK";
+  for (const p of subSlot.onField) {
+    if (p.id === playerOffId) continue; // subbed off
+    grid[playerIdx[p.id]][slotIndex] = "FIELD";
+  }
+  // If the GK was subbed off, handle that edge case
+  if (subSlot.gk.id === playerOffId) {
+    // Can't sub off GK through this mechanism — just keep them
+    grid[playerIdx[subSlot.gk.id]][slotIndex] = "GK";
+    // Put the sub-on player on field instead
+    grid[playerIdx[playerOnId]][slotIndex] = "FIELD";
+  } else {
+    grid[playerIdx[playerOnId]][slotIndex] = "FIELD";
+  }
+
+  // Calculate targets
+  const totalPitchSlots = ON_PITCH * SLOTS;
+  const targetHigh = Math.ceil(totalPitchSlots / N);
+  const targetLow = Math.floor(totalPitchSlots / N);
+  const numHigh = totalPitchSlots - targetLow * N;
+
+  const pitchCount = () => ALL.map((_, i) => grid[i].filter(v => v !== null).length);
+
+  const targets = new Array(N).fill(targetLow);
+  const sortedForTarget = ALL.map((p, i) => i);
+  sortedForTarget.sort((a, b) => {
+    const gkA = grid[a].filter(v => v === "GK").length;
+    const gkB = grid[b].filter(v => v === "GK").length;
+    if (gkA !== gkB) return gkA - gkB;
+    const cA = cIds.has(ALL[a].id) ? 1 : 0;
+    const cB = cIds.has(ALL[b].id) ? 1 : 0;
+    return cA - cB;
+  });
+  let highLeft = numHigh;
+  for (const idx of sortedForTarget) {
+    if (highLeft > 0) { targets[idx] = targetHigh; highLeft--; }
+  }
+
+  // Track consecutive bench/field up through slotIndex
+  const consBench = new Array(N).fill(0);
+  const consField = new Array(N).fill(0);
+  for (let s = 0; s <= slotIndex; s++) {
+    for (let i = 0; i < N; i++) {
+      if (grid[i][s] !== null) { consField[i]++; consBench[i] = 0; }
+      else { consBench[i]++; consField[i] = 0; }
+    }
+  }
+
+  // Generate remaining slots (slotIndex+1 through SLOTS-1)
+  for (let s = slotIndex + 1; s < SLOTS; s++) {
+    const gkIdx = playerIdx[gkSchedule[s].id];
+    grid[gkIdx][s] = "GK";
+    const available = ALL.map((_, i) => i).filter(i => i !== gkIdx);
+    const slotsRemaining = SLOTS - s;
+    const currentCounts = pitchCount();
+
+    const need = available.map(i => ({
+      idx: i, need: targets[i] - currentCounts[i],
+      urgency: (targets[i] - currentCounts[i]) / slotsRemaining
+    }));
+
+    if (s === 5) {
+      // Halftime reset
+      need.sort((a, b) => {
+        if (b.urgency !== a.urgency) return b.urgency - a.urgency;
+        return consBench[b.idx] - consBench[a.idx];
+      });
+      const selected = new Set();
+      let cFieldCount = 0;
+      for (const u of need) {
+        if (selected.size >= FIELD_SPOTS) break;
+        const isCp = cIds.has(ALL[u.idx].id);
+        if (isCp && cFieldCount >= 1 && u.urgency < 0.55) continue;
+        selected.add(u.idx);
+        if (isCp) cFieldCount++;
+      }
+      for (const u of need) {
+        if (selected.size >= FIELD_SPOTS) break;
+        selected.add(u.idx);
+      }
+      for (const i of selected) grid[i][s] = "FIELD";
+    } else {
+      // Normal sub rotation
+      const prevField = new Set();
+      for (let i = 0; i < N; i++) {
+        if (grid[i][s - 1] === "FIELD") prevField.add(i);
+      }
+      const prevGkIdx = playerIdx[gkSchedule[s - 1].id];
+      const stayingPool = [...prevField].filter(i => i !== gkIdx);
+      const benchPool = available.filter(i => !prevField.has(i) && i !== gkIdx);
+      if (prevGkIdx !== gkIdx && !prevField.has(prevGkIdx)) benchPool.push(prevGkIdx);
+      const gkWasField = prevField.has(gkIdx);
+      const prevGkNowAvailable = prevGkIdx !== gkIdx;
+
+      const countsNow = pitchCount();
+      const mustOn = benchPool.filter(i => consBench[i] >= 2 && (targets[i] - countsNow[i]) > 0);
+
+      const eligibleOff = [...stayingPool].sort((a, b) => {
+        const protA = consField[a] < 2 ? 1 : 0;
+        const protB = consField[b] < 2 ? 1 : 0;
+        if (protA !== protB) return protA - protB;
+        const overA = countsNow[a] - targets[a];
+        const overB = countsNow[b] - targets[b];
+        if (overA !== overB) return overB - overA;
+        if (countsNow[b] !== countsNow[a]) return countsNow[b] - countsNow[a];
+        return consField[b] - consField[a];
+      });
+
+      const sortedBench = [...benchPool].sort((a, b) => {
+        const needA = targets[a] - countsNow[a];
+        const needB = targets[b] - countsNow[b];
+        if (needB !== needA) return needB - needA;
+        if (consBench[b] !== consBench[a]) return consBench[b] - consBench[a];
+        return countsNow[a] - countsNow[b];
+      });
+
+      let comingOff = [];
+      let comingOn = [];
+
+      if (prevGkNowAvailable) {
+        const prevGkNeed = targets[prevGkIdx] - countsNow[prevGkIdx];
+        if (prevGkNeed > 0) comingOn.push(prevGkIdx);
+      }
+      if (gkWasField) comingOff.push(gkIdx);
+
+      for (const i of mustOn) { if (!comingOn.includes(i)) comingOn.push(i); }
+
+      const subsTarget = Math.max(SUBS, comingOn.length, comingOff.length);
+      for (const i of sortedBench) {
+        if (comingOn.length >= subsTarget) break;
+        if (!comingOn.includes(i)) comingOn.push(i);
+      }
+      for (const i of eligibleOff) {
+        if (comingOff.length >= subsTarget) break;
+        if (!comingOff.includes(i) && i !== gkIdx) comingOff.push(i);
+      }
+
+      const subCount = Math.min(comingOn.length, comingOff.length);
+      let actualOff = comingOff.slice(0, subCount);
+      let actualOn = comingOn.slice(0, subCount);
+
+      const newField = new Set();
+      for (const i of stayingPool) { if (!actualOff.includes(i)) newField.add(i); }
+      for (const i of actualOn) { if (i !== gkIdx) newField.add(i); }
+
+      while (newField.size > FIELD_SPOTS) {
+        const arr = [...newField];
+        const counts = pitchCount();
+        arr.sort((a, b) => counts[b] - counts[a]);
+        newField.delete(arr[0]);
+      }
+      while (newField.size < FIELD_SPOTS) {
+        const counts = pitchCount();
+        const candidates = available.filter(i => !newField.has(i) && i !== gkIdx);
+        candidates.sort((a, b) => counts[a] - counts[b]);
+        if (candidates.length > 0) newField.add(candidates[0]);
+        else break;
+      }
+
+      for (const i of newField) grid[i][s] = "FIELD";
+    }
+
+    for (let i = 0; i < N; i++) {
+      if (grid[i][s] !== null) { consField[i]++; consBench[i] = 0; }
+      else { consBench[i]++; consField[i] = 0; }
+    }
+  }
+
+  // Build output (same as Phase 5 of generateSchedule)
+  const slotsOutput = [];
+  let prevPositions = {};
+
+  for (let s = 0; s < SLOTS; s++) {
+    const gkPlayer = gkSchedule[s];
+    const gkIdxS = playerIdx[gkPlayer.id];
+    const fieldPlayers = [];
+    const benchPlayers = [];
+
+    for (let i = 0; i < N; i++) {
+      if (i === gkIdxS) continue;
+      if (grid[i][s] === "FIELD") fieldPlayers.push(ALL[i]);
+      else if (grid[i][s] === null) benchPlayers.push(ALL[i]);
+    }
+
+    let comingOn = [];
+    let comingOff = [];
+    let positions = {};
+
+    if (s > 0) {
+      const prevOnPitch = new Set();
+      for (let i = 0; i < N; i++) {
+        if (grid[i][s - 1] !== null) prevOnPitch.add(ALL[i].id);
+      }
+      const currOnPitch = new Set();
+      currOnPitch.add(gkPlayer.id);
+      fieldPlayers.forEach(p => currOnPitch.add(p.id));
+      comingOn = [...currOnPitch].filter(id => !prevOnPitch.has(id)).map(id => ALL.find(p => p.id === id)).filter(Boolean);
+      comingOff = [...prevOnPitch].filter(id => !currOnPitch.has(id)).map(id => ALL.find(p => p.id === id)).filter(Boolean);
+    }
+
+    if (s === 0 || s === 5) {
+      positions = assignFieldPositions(fieldPlayers);
+    } else {
+      const vacatedPositions = [];
+      for (const p of fieldPlayers) {
+        if (prevPositions[p.id] && !comingOn.find(x => x.id === p.id)) {
+          positions[p.id] = prevPositions[p.id];
+        }
+      }
+      for (const p of comingOff) {
+        const pos = prevPositions[p.id];
+        if (pos && pos !== "GK") vacatedPositions.push(pos);
+      }
+      const prevGkId = s > 0 ? gkSchedule[s - 1].id : null;
+      if (prevGkId && prevGkId !== gkPlayer.id) {
+        const newGkOldPos = prevPositions[gkPlayer.id];
+        if (newGkOldPos && newGkOldPos !== "GK") vacatedPositions.push(newGkOldPos);
+      }
+
+      const unassigned = comingOn.filter(p => !positions[p.id] && p.id !== gkPlayer.id);
+      for (const p of unassigned.sort((a, b) => {
+        const aOpts = vacatedPositions.filter(pos => canPlayField(a, pos)).length;
+        const bOpts = vacatedPositions.filter(pos => canPlayField(b, pos)).length;
+        return aOpts - bOpts;
+      })) {
+        let assigned = false;
+        const priIdx = vacatedPositions.indexOf(p.positions.primary);
+        if (priIdx !== -1 && p.positions.primary !== "GK") {
+          positions[p.id] = p.positions.primary; vacatedPositions.splice(priIdx, 1); assigned = true;
+        }
+        if (!assigned) {
+          for (let vi = 0; vi < vacatedPositions.length; vi++) {
+            if (canPlayField(p, vacatedPositions[vi])) {
+              positions[p.id] = vacatedPositions[vi]; vacatedPositions.splice(vi, 1); assigned = true; break;
+            }
+          }
+        }
+        if (!assigned && vacatedPositions.length > 0) positions[p.id] = vacatedPositions.shift();
+      }
+
+      const stillUnassigned = fieldPlayers.filter(p => !positions[p.id]);
+      if (stillUnassigned.length > 0) {
+        const remaining = { DEF: 3, MID: 3, FWD: 2 };
+        for (const id in positions) {
+          if (positions[id] && positions[id] !== "GK" && remaining[positions[id]] !== undefined) remaining[positions[id]]--;
+        }
+        for (const p of stillUnassigned) {
+          for (const pos of ["DEF", "MID", "FWD"]) {
+            if (remaining[pos] > 0 && canPlayField(p, pos)) { positions[p.id] = pos; remaining[pos]--; break; }
+          }
+          if (!positions[p.id]) {
+            for (const pos of ["DEF", "MID", "FWD"]) {
+              if (remaining[pos] > 0) { positions[p.id] = pos; remaining[pos]--; break; }
+            }
+          }
+        }
+      }
+    }
+
+    positions[gkPlayer.id] = "GK";
+    prevPositions = { ...positions };
+
+    const onPitchAll = [gkPlayer, ...fieldPlayers];
+    const cCount = onPitchAll.filter(p => cIds.has(p.id)).length;
+
+    slotsOutput.push({
+      slotIndex: s, time: SLOT_LABELS[s].time, label: SLOT_LABELS[s].label,
+      gk: gkPlayer, onField: fieldPlayers, bench: benchPlayers, positions,
+      comingOn, comingOff, cCount,
+      gkChanged: s > 0 && gkSchedule[s].id !== gkSchedule[s - 1].id,
+      isLocked: s <= slotIndex,
+    });
+  }
+
+  const summary = ALL.map((p, i) => {
+    const totalOnPitch = grid[i].filter(v => v !== null).length;
+    const gkSlots = grid[i].filter(v => v === "GK").length;
+    const fieldSlots = grid[i].filter(v => v === "FIELD").length;
+    const posUsed = new Set();
+    slotsOutput.forEach(sl => { if (sl.positions[p.id]) posUsed.add(sl.positions[p.id]); });
+    return { ...p, slotsPlayed: totalOnPitch, gkSlots, fieldSlots, totalMinutes: totalOnPitch * 5, positionsUsed: [...posUsed] };
+  });
+
+  return { slots: slotsOutput, summary, error: null };
+  } catch (e) {
+    console.error("Regeneration error:", e);
+    return { error: "Regeneration failed: " + e.message, slots: [], summary: [] };
+  }
+}
+
 // ─── FIELD SVG ───────────────────────────────────────────────
 function FieldGraphic({ slot }) {
   const { gk, onField, positions, comingOn, comingOff, bench, gkChanged } = slot;
@@ -852,6 +1180,11 @@ function SoccerApp() {
   const [checkedIn, setCheckedIn] = useState(new Set());
   const [scheduleData, setScheduleData] = useState(null);
   const [seed, setSeed] = useState(0);
+  const [selectedGK1, setSelectedGK1] = useState(null); // 1st half GK player id
+  const [selectedGK2, setSelectedGK2] = useState(null); // 2nd half GK player id
+  const [manualSubSlot, setManualSubSlot] = useState(null); // slot index being edited
+  const [subOffId, setSubOffId] = useState(null);
+  const [subOnId, setSubOnId] = useState(null);
 
   const [newName, setNewName] = useState("");
   const [newTier, setNewTier] = useState("B");
@@ -890,20 +1223,37 @@ function SoccerApp() {
   }, []);
   const checkInAll = useCallback(() => setCheckedIn(new Set(roster.map(p => p.id))), [roster]);
 
+  const selectedGoalies = useMemo(() => {
+    if (selectedGK1 && selectedGK2) return { firstHalf: selectedGK1, secondHalf: selectedGK2 };
+    return null;
+  }, [selectedGK1, selectedGK2]);
+
   const generateRotation = useCallback(() => {
     const attendees = roster.filter(p => checkedIn.has(p.id));
-    const result = generateSchedule(attendees, seed);
+    const result = generateSchedule(attendees, seed, selectedGoalies);
     setScheduleData(result);
+    setManualSubSlot(null);
     if (!result.error) setScreen("schedule");
-  }, [roster, checkedIn, seed]);
+  }, [roster, checkedIn, seed, selectedGoalies]);
 
   const reshuffle = useCallback(() => {
     const newSeed = seed + 1;
     setSeed(newSeed);
     const attendees = roster.filter(p => checkedIn.has(p.id));
-    const result = generateSchedule(attendees, newSeed);
+    const result = generateSchedule(attendees, newSeed, selectedGoalies);
     setScheduleData(result);
-  }, [roster, checkedIn, seed]);
+    setManualSubSlot(null);
+  }, [roster, checkedIn, seed, selectedGoalies]);
+
+  const applyManualSub = useCallback(() => {
+    if (manualSubSlot === null || !subOffId || !subOnId || !scheduleData) return;
+    const attendees = roster.filter(p => checkedIn.has(p.id));
+    const result = applyManualSubAndRegenerate(scheduleData, attendees, manualSubSlot, subOffId, subOnId, selectedGoalies);
+    setScheduleData(result);
+    setManualSubSlot(null);
+    setSubOffId(null);
+    setSubOnId(null);
+  }, [manualSubSlot, subOffId, subOnId, scheduleData, roster, checkedIn, selectedGoalies]);
 
   const S = {
     app: { minHeight: "100vh", background: "#050f08", color: "#f0f9f0", fontFamily: "system-ui, -apple-system, sans-serif", paddingBottom: 60 },
@@ -1002,6 +1352,54 @@ function SoccerApp() {
             })}
           </div>
         </div>
+        {/* GK Selection */}
+        {cc >= 9 && (() => {
+          const gkEligible = roster.filter(p => checkedIn.has(p.id) && (p.positions.primary === "GK" || p.positions.secondary.includes("GK")));
+          return (
+            <div style={S.card}>
+              <div style={{ fontSize: 13, fontWeight: 700, color: "#60a5fa", marginBottom: 10 }}>Goalkeeper Selection</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                <div>
+                  <span style={S.lbl}>1st Half GK</span>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
+                    {gkEligible.map(p => (
+                      <button key={p.id} onClick={() => setSelectedGK1(p.id)} style={{
+                        padding: "8px 14px", borderRadius: 8, fontSize: 13, fontWeight: 600, cursor: "pointer",
+                        border: selectedGK1 === p.id ? "2px solid #60a5fa" : "1px solid rgba(255,255,255,0.12)",
+                        background: selectedGK1 === p.id ? "rgba(96,165,250,0.15)" : "rgba(0,0,0,0.25)",
+                        color: selectedGK1 === p.id ? "#93c5fd" : "rgba(255,255,255,0.5)",
+                      }}>
+                        {p.name}
+                        {p.positions.primary === "GK" && <span style={{ fontSize: 9, marginLeft: 4, opacity: 0.6 }}>(Primary)</span>}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div>
+                  <span style={S.lbl}>2nd Half GK</span>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
+                    {gkEligible.map(p => (
+                      <button key={p.id} onClick={() => setSelectedGK2(p.id)} style={{
+                        padding: "8px 14px", borderRadius: 8, fontSize: 13, fontWeight: 600, cursor: "pointer",
+                        border: selectedGK2 === p.id ? "2px solid #60a5fa" : "1px solid rgba(255,255,255,0.12)",
+                        background: selectedGK2 === p.id ? "rgba(96,165,250,0.15)" : "rgba(0,0,0,0.25)",
+                        color: selectedGK2 === p.id ? "#93c5fd" : "rgba(255,255,255,0.5)",
+                      }}>
+                        {p.name}
+                        {p.positions.primary === "GK" && <span style={{ fontSize: 9, marginLeft: 4, opacity: 0.6 }}>(Primary)</span>}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                {!selectedGK1 || !selectedGK2 ? (
+                  <div style={{ padding: "6px 10px", borderRadius: 6, background: "rgba(96,165,250,0.08)", border: "1px solid rgba(96,165,250,0.15)", fontSize: 11, color: "#93c5fd" }}>
+                    Select a GK for each half, or leave unselected for auto-assign
+                  </div>
+                ) : null}
+              </div>
+            </div>
+          );
+        })()}
         <div style={S.card}>
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
             {!hasGk && cc > 0 && <div style={{ padding: "8px 10px", borderRadius: 8, background: "rgba(239,68,68,0.08)", border: "1px solid rgba(239,68,68,0.15)", fontSize: 12, color: "#fca5a5" }}>⚠ No GK-eligible player checked in</div>}
@@ -1045,16 +1443,73 @@ function SoccerApp() {
         </div>
 
         {slots.map(slot => (
-          <div key={slot.slotIndex} style={S.card}>
+          <div key={slot.slotIndex} style={{ ...S.card, borderColor: slot.isLocked ? "rgba(245,158,11,0.2)" : "rgba(255,255,255,0.1)" }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
               <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                 <span style={{ fontSize: 22, fontWeight: 900, color: "white", fontFamily: "monospace", letterSpacing: -1 }}>{slot.time}</span>
                 {slot.label && <span style={{ fontSize: 11, fontWeight: 700, padding: "3px 8px", borderRadius: 4, background: slot.label === "2nd Half" ? "rgba(59,130,246,0.2)" : "rgba(74,222,128,0.15)", color: slot.label === "2nd Half" ? "#93c5fd" : "#86efac" }}>{slot.label}</span>}
                 {slot.gkChanged && <span style={{ fontSize: 10, fontWeight: 700, padding: "3px 7px", borderRadius: 4, background: "rgba(96,165,250,0.2)", color: "#93c5fd" }}>GK swap</span>}
                 {slot.cCount > 1 && <span style={{ fontSize: 10, fontWeight: 700, padding: "3px 7px", borderRadius: 4, background: "rgba(245,158,11,0.15)", color: "#fbbf24" }}>{slot.cCount}× C</span>}
+                {slot.isLocked && <span style={{ fontSize: 9, fontWeight: 700, padding: "3px 7px", borderRadius: 4, background: "rgba(245,158,11,0.12)", color: "#fbbf24" }}>LOCKED</span>}
               </div>
-              <span style={{ fontSize: 11, color: "rgba(255,255,255,0.4)", fontWeight: 700 }}>{slot.slotIndex + 1}/10</span>
+              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                {slot.bench.length > 0 && manualSubSlot !== slot.slotIndex && (
+                  <button onClick={() => { setManualSubSlot(slot.slotIndex); setSubOffId(null); setSubOnId(null); }} style={{
+                    padding: "4px 10px", borderRadius: 6, fontSize: 10, fontWeight: 700,
+                    border: "1px solid rgba(245,158,11,0.35)", background: "rgba(245,158,11,0.1)",
+                    color: "#fcd34d", cursor: "pointer", textTransform: "uppercase", letterSpacing: 0.5
+                  }}>Manual Sub</button>
+                )}
+                <span style={{ fontSize: 11, color: "rgba(255,255,255,0.4)", fontWeight: 700 }}>{slot.slotIndex + 1}/10</span>
+              </div>
             </div>
+
+            {/* Manual Sub UI */}
+            {manualSubSlot === slot.slotIndex && (
+              <div style={{ marginBottom: 10, padding: 12, background: "rgba(245,158,11,0.06)", borderRadius: 10, border: "1px solid rgba(245,158,11,0.2)" }}>
+                <div style={{ fontSize: 12, fontWeight: 700, color: "#fcd34d", marginBottom: 8 }}>Manual Substitution</div>
+                <div style={{ marginBottom: 8 }}>
+                  <span style={{ ...S.lbl, color: "#fde68a" }}>Sub Off (on field)</span>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+                    {slot.onField.map(p => (
+                      <button key={p.id} onClick={() => setSubOffId(p.id)} style={{
+                        padding: "6px 12px", borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: "pointer",
+                        border: subOffId === p.id ? "2px solid #f87171" : "1px solid rgba(255,255,255,0.12)",
+                        background: subOffId === p.id ? "rgba(248,113,113,0.15)" : "rgba(0,0,0,0.3)",
+                        color: subOffId === p.id ? "#fca5a5" : "rgba(255,255,255,0.6)",
+                      }}>{p.name}</button>
+                    ))}
+                  </div>
+                </div>
+                <div style={{ marginBottom: 8 }}>
+                  <span style={{ ...S.lbl, color: "#86efac" }}>Sub On (from bench)</span>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+                    {slot.bench.map(p => (
+                      <button key={p.id} onClick={() => setSubOnId(p.id)} style={{
+                        padding: "6px 12px", borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: "pointer",
+                        border: subOnId === p.id ? "2px solid #4ade80" : "1px solid rgba(255,255,255,0.12)",
+                        background: subOnId === p.id ? "rgba(74,222,128,0.15)" : "rgba(0,0,0,0.3)",
+                        color: subOnId === p.id ? "#86efac" : "rgba(255,255,255,0.6)",
+                      }}>{p.name}</button>
+                    ))}
+                  </div>
+                </div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button onClick={applyManualSub} disabled={!subOffId || !subOnId} style={{
+                    flex: 1, padding: "10px", borderRadius: 8, border: "none", fontSize: 13, fontWeight: 700, cursor: subOffId && subOnId ? "pointer" : "not-allowed",
+                    background: subOffId && subOnId ? "linear-gradient(135deg, #f59e0b, #d97706)" : "rgba(255,255,255,0.08)",
+                    color: subOffId && subOnId ? "white" : "rgba(255,255,255,0.3)", textTransform: "uppercase", letterSpacing: 0.5
+                  }}>Apply Sub & Recalculate</button>
+                  <button onClick={() => { setManualSubSlot(null); setSubOffId(null); setSubOnId(null); }} style={{
+                    padding: "10px 16px", borderRadius: 8, border: "1px solid rgba(255,255,255,0.15)",
+                    background: "rgba(0,0,0,0.3)", color: "rgba(255,255,255,0.5)", fontSize: 12, fontWeight: 600, cursor: "pointer"
+                  }}>Cancel</button>
+                </div>
+                <div style={{ marginTop: 6, fontSize: 10, color: "rgba(255,255,255,0.3)" }}>
+                  Future slots will be recalculated to equalize playing time
+                </div>
+              </div>
+            )}
 
             {slot.slotIndex > 0 && (slot.comingOn.length > 0 || slot.comingOff.length > 0) && (
               <div style={{ marginBottom: 8, display: "flex", gap: 6, flexWrap: "wrap" }}>
