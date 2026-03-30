@@ -88,18 +88,21 @@ const DEFAULT_ROSTER = [
   { id: 1014, name: "Brian", tier: "C", positions: { primary: "MID", secondary: ["FWD"] } },
 ];
 
-const SLOT_LABELS = [
-  { time: "0:00", label: "Kickoff" },
-  { time: "5:00", label: "" },
-  { time: "10:00", label: "" },
-  { time: "15:00", label: "" },
-  { time: "20:00", label: "" },
-  { time: "25:00", label: "2nd Half" },
-  { time: "30:00", label: "" },
-  { time: "35:00", label: "" },
-  { time: "40:00", label: "" },
-  { time: "45:00", label: "" },
-];
+function buildSlotLabels(firstHalfMin, secondHalfMin, interval) {
+  const labels = [];
+  const firstHalfSlots = Math.max(1, Math.round(firstHalfMin / interval));
+  const secondHalfSlots = Math.max(1, Math.round(secondHalfMin / interval));
+  for (let i = 0; i < firstHalfSlots; i++) {
+    const m = i * interval;
+    labels.push({ time: `${m}:00`, label: i === 0 ? "Kickoff" : "" });
+  }
+  for (let i = 0; i < secondHalfSlots; i++) {
+    const m = firstHalfMin + i * interval;
+    labels.push({ time: `${m}:00`, label: i === 0 ? "2nd Half" : "" });
+  }
+  return labels;
+}
+
 
 const POS_LIST = ["GK", "DEF", "MID", "FWD"];
 const TIER_COLORS = { A: "#22c55e", B: "#3b82f6", C: "#f59e0b" };
@@ -153,8 +156,14 @@ function assignFieldPositions(fieldPlayers) {
 
 // ─── MAIN SCHEDULE GENERATOR ─────────────────────────────────
 
-function generateSchedule(attendees, seed = 0, selectedGoalies = null) {
+function generateSchedule(attendees, seed = 0, selectedGoalies = null, gameConfig = null) {
   try {
+  const cfg = gameConfig || { firstHalfMin: 25, secondHalfMin: 25, interval: 5 };
+  const FIRST_HALF_SLOTS = Math.max(1, Math.round(cfg.firstHalfMin / cfg.interval));
+  const SECOND_HALF_SLOTS = Math.max(1, Math.round(cfg.secondHalfMin / cfg.interval));
+  const HALFTIME = FIRST_HALF_SLOTS;
+  const SLOT_LABELS = buildSlotLabels(cfg.firstHalfMin, cfg.secondHalfMin, cfg.interval);
+
   // Seeded shuffle utility for re-optimize
   const seededRandom = (s) => {
     let x = Math.sin(s + 1) * 10000;
@@ -173,7 +182,7 @@ function generateSchedule(attendees, seed = 0, selectedGoalies = null) {
   const N = ALL.length;
   if (N < 9) return { error: `Need at least 9 players (have ${N})`, slots: [], summary: [] };
 
-  const SLOTS = 10;
+  const SLOTS = FIRST_HALF_SLOTS + SECOND_HALF_SLOTS;
   const ON_PITCH = 9; // GK + 8 field
   const FIELD_SPOTS = 8;
   const SUBS = 3;
@@ -196,18 +205,18 @@ function generateSchedule(attendees, seed = 0, selectedGoalies = null) {
     const gk2 = ALL.find(p => p.id === selectedGoalies.secondHalf);
     if (!gk1 || !gk2) return { error: "Selected goalkeepers not found in attendees", slots: [], summary: [] };
     for (let s = 0; s < SLOTS; s++) {
-      gkSchedule[s] = s < 5 ? gk1 : gk2;
+      gkSchedule[s] = s < HALFTIME ? gk1 : gk2;
     }
   } else if (primaryGK) {
     const sec1 = secondaryGKs[0] || primaryGK;
     for (let s = 0; s < SLOTS; s++) {
-      gkSchedule[s] = s < 5 ? primaryGK : sec1;
+      gkSchedule[s] = s < HALFTIME ? primaryGK : sec1;
     }
   } else {
     const gk1 = gkEligible[0];
     const gk2 = gkEligible.length > 1 ? gkEligible[1] : gkEligible[0];
     for (let s = 0; s < SLOTS; s++) {
-      gkSchedule[s] = s < 5 ? gk1 : gk2;
+      gkSchedule[s] = s < HALFTIME ? gk1 : gk2;
     }
   }
 
@@ -278,7 +287,7 @@ function generateSchedule(attendees, seed = 0, selectedGoalies = null) {
       return { idx: i, need: remaining, urgency: remaining / slotsRemaining };
     });
 
-    if (s === 0 || s === 5) {
+    if (s === 0 || s === HALFTIME) {
       // Fresh lineup (kickoff or halftime reset)
       need.sort((a, b) => {
         if (b.urgency !== a.urgency) return b.urgency - a.urgency;
@@ -499,7 +508,7 @@ function generateSchedule(attendees, seed = 0, selectedGoalies = null) {
   }
 
   function checkTransitions(g, n, totalSlots, maxSubs, removeIdx, addIdx, slot) {
-    if (slot === 5) return true; // halftime reset
+    if (slot === HALFTIME) return true; // halftime reset
     const getOnPitch = (s, applySwap) => {
       const set = new Set();
       for (let i = 0; i < n; i++) {
@@ -514,7 +523,7 @@ function generateSchedule(attendees, seed = 0, selectedGoalies = null) {
     };
 
     // Check transition from slot-1 to slot
-    if (slot > 0 && slot !== 5) {
+    if (slot > 0 && slot !== HALFTIME) {
       const prev = getOnPitch(slot - 1, false);
       const curr = getOnPitch(slot, true);
       let off = 0;
@@ -523,7 +532,7 @@ function generateSchedule(attendees, seed = 0, selectedGoalies = null) {
       if (off > maxSubs + 1) return false;
     }
     // Check transition from slot to slot+1
-    if (slot < totalSlots - 1 && slot + 1 !== 5) {
+    if (slot < totalSlots - 1 && slot + 1 !== HALFTIME) {
       const curr = getOnPitch(slot, true);
       const next = getOnPitch(slot + 1, false);
       let off = 0;
@@ -569,7 +578,7 @@ function generateSchedule(attendees, seed = 0, selectedGoalies = null) {
       comingOff = [...prevOnPitch].filter(id => !currOnPitch.has(id)).map(id => ALL.find(p => p.id === id)).filter(Boolean);
     }
 
-    if (s === 0 || s === 5) {
+    if (s === 0 || s === HALFTIME) {
       // Fresh assignment from scratch
       positions = assignFieldPositions(fieldPlayers);
     } else {
@@ -705,11 +714,17 @@ function generateSchedule(attendees, seed = 0, selectedGoalies = null) {
 }
 
 // ─── MANUAL SUB + REGENERATION ──────────────────────────────
-function applyManualSubAndRegenerate(currentSchedule, attendees, slotIndex, playerOffId, playerOnId, selectedGoalies) {
+function applyManualSubAndRegenerate(currentSchedule, attendees, slotIndex, playerOffId, playerOnId, selectedGoalies, gameConfig = null) {
   try {
+  const cfg = gameConfig || { firstHalfMin: 25, secondHalfMin: 25, interval: 5 };
+  const FIRST_HALF_SLOTS = Math.max(1, Math.round(cfg.firstHalfMin / cfg.interval));
+  const SECOND_HALF_SLOTS = Math.max(1, Math.round(cfg.secondHalfMin / cfg.interval));
+  const HALFTIME = FIRST_HALF_SLOTS;
+  const SLOT_LABELS = buildSlotLabels(cfg.firstHalfMin, cfg.secondHalfMin, cfg.interval);
+
   const ALL = [...attendees];
   const N = ALL.length;
-  const SLOTS = 10;
+  const SLOTS = FIRST_HALF_SLOTS + SECOND_HALF_SLOTS;
   const ON_PITCH = 9;
   const FIELD_SPOTS = 8;
   const SUBS = 3;
@@ -723,7 +738,7 @@ function applyManualSubAndRegenerate(currentSchedule, attendees, slotIndex, play
   if (selectedGoalies && selectedGoalies.firstHalf && selectedGoalies.secondHalf) {
     const gk1 = ALL.find(p => p.id === selectedGoalies.firstHalf);
     const gk2 = ALL.find(p => p.id === selectedGoalies.secondHalf);
-    for (let s = 0; s < SLOTS; s++) gkSchedule[s] = s < 5 ? gk1 : gk2;
+    for (let s = 0; s < SLOTS; s++) gkSchedule[s] = s < HALFTIME ? gk1 : gk2;
   } else {
     for (let s = 0; s < SLOTS; s++) gkSchedule[s] = currentSchedule.slots[s].gk;
   }
@@ -801,7 +816,7 @@ function applyManualSubAndRegenerate(currentSchedule, attendees, slotIndex, play
       urgency: (targets[i] - currentCounts[i]) / slotsRemaining
     }));
 
-    if (s === 5) {
+    if (s === HALFTIME) {
       // Halftime reset
       need.sort((a, b) => {
         if (b.urgency !== a.urgency) return b.urgency - a.urgency;
@@ -940,7 +955,7 @@ function applyManualSubAndRegenerate(currentSchedule, attendees, slotIndex, play
       comingOff = [...prevOnPitch].filter(id => !currOnPitch.has(id)).map(id => ALL.find(p => p.id === id)).filter(Boolean);
     }
 
-    if (s === 0 || s === 5) {
+    if (s === 0 || s === HALFTIME) {
       positions = assignFieldPositions(fieldPlayers);
     } else {
       const vacatedPositions = [];
@@ -1182,6 +1197,9 @@ function SoccerApp() {
   const [seed, setSeed] = useState(0);
   const [selectedGK1, setSelectedGK1] = useState(null); // 1st half GK player id
   const [selectedGK2, setSelectedGK2] = useState(null); // 2nd half GK player id
+  const [firstHalfMin, setFirstHalfMin] = useState(25);
+  const [secondHalfMin, setSecondHalfMin] = useState(30);
+  const [subInterval, setSubInterval] = useState(5);
   const [manualSubSlot, setManualSubSlot] = useState(null); // slot index being edited
   const [subOffId, setSubOffId] = useState(null);
   const [subOnId, setSubOnId] = useState(null);
@@ -1228,32 +1246,36 @@ function SoccerApp() {
     return null;
   }, [selectedGK1, selectedGK2]);
 
+  const gameConfig = useMemo(() => ({
+    firstHalfMin, secondHalfMin, interval: subInterval
+  }), [firstHalfMin, secondHalfMin, subInterval]);
+
   const generateRotation = useCallback(() => {
     const attendees = roster.filter(p => checkedIn.has(p.id));
-    const result = generateSchedule(attendees, seed, selectedGoalies);
+    const result = generateSchedule(attendees, seed, selectedGoalies, gameConfig);
     setScheduleData(result);
     setManualSubSlot(null);
     if (!result.error) setScreen("schedule");
-  }, [roster, checkedIn, seed, selectedGoalies]);
+  }, [roster, checkedIn, seed, selectedGoalies, gameConfig]);
 
   const reshuffle = useCallback(() => {
     const newSeed = seed + 1;
     setSeed(newSeed);
     const attendees = roster.filter(p => checkedIn.has(p.id));
-    const result = generateSchedule(attendees, newSeed, selectedGoalies);
+    const result = generateSchedule(attendees, newSeed, selectedGoalies, gameConfig);
     setScheduleData(result);
     setManualSubSlot(null);
-  }, [roster, checkedIn, seed, selectedGoalies]);
+  }, [roster, checkedIn, seed, selectedGoalies, gameConfig]);
 
   const applyManualSub = useCallback(() => {
     if (manualSubSlot === null || !subOffId || !subOnId || !scheduleData) return;
     const attendees = roster.filter(p => checkedIn.has(p.id));
-    const result = applyManualSubAndRegenerate(scheduleData, attendees, manualSubSlot, subOffId, subOnId, selectedGoalies);
+    const result = applyManualSubAndRegenerate(scheduleData, attendees, manualSubSlot, subOffId, subOnId, selectedGoalies, gameConfig);
     setScheduleData(result);
     setManualSubSlot(null);
     setSubOffId(null);
     setSubOnId(null);
-  }, [manualSubSlot, subOffId, subOnId, scheduleData, roster, checkedIn, selectedGoalies]);
+  }, [manualSubSlot, subOffId, subOnId, scheduleData, roster, checkedIn, selectedGoalies, gameConfig]);
 
   const S = {
     app: { minHeight: "100vh", background: "#050f08", color: "#f0f9f0", fontFamily: "system-ui, -apple-system, sans-serif", paddingBottom: 60 },
@@ -1351,6 +1373,40 @@ function SoccerApp() {
               );
             })}
           </div>
+        </div>
+        {/* Game Duration */}
+        <div style={S.card}>
+          <div style={{ fontSize: 13, fontWeight: 700, color: "#4ade80", marginBottom: 10 }}>Game Settings</div>
+          <div style={{ display: "flex", gap: 10 }}>
+            <div style={{ flex: 1 }}>
+              <span style={S.lbl}>1st Half (min)</span>
+              <input type="number" min="5" max="60" step="1" value={firstHalfMin} onChange={e => setFirstHalfMin(Math.max(5, parseInt(e.target.value) || 5))} style={{ ...S.input, textAlign: "center", fontSize: 18, fontWeight: 700 }} />
+            </div>
+            <div style={{ flex: 1 }}>
+              <span style={S.lbl}>2nd Half (min)</span>
+              <input type="number" min="5" max="60" step="1" value={secondHalfMin} onChange={e => setSecondHalfMin(Math.max(5, parseInt(e.target.value) || 5))} style={{ ...S.input, textAlign: "center", fontSize: 18, fontWeight: 700 }} />
+            </div>
+            <div style={{ flex: 1 }}>
+              <span style={S.lbl}>Sub Interval</span>
+              <input type="number" min="3" max="15" step="1" value={subInterval} onChange={e => setSubInterval(Math.max(3, parseInt(e.target.value) || 5))} style={{ ...S.input, textAlign: "center", fontSize: 18, fontWeight: 700 }} />
+            </div>
+          </div>
+          {(() => {
+            const slots1 = Math.max(1, Math.round(firstHalfMin / subInterval));
+            const slots2 = Math.max(1, Math.round(secondHalfMin / subInterval));
+            const total = slots1 + slots2;
+            const playerSlots = 9 * total;
+            const cc = checkedIn.size;
+            const perPlayer = cc > 0 ? (playerSlots / cc).toFixed(1) : "—";
+            const isEven = cc > 0 && playerSlots % cc === 0;
+            return (
+              <div style={{ marginTop: 8, padding: "8px 10px", background: "rgba(0,0,0,0.2)", borderRadius: 6, fontSize: 11, color: "rgba(255,255,255,0.4)", display: "flex", gap: 12, flexWrap: "wrap", alignItems: "center" }}>
+                <span>{total} slots ({slots1} + {slots2})</span>
+                <span>{firstHalfMin + secondHalfMin} min total</span>
+                {cc > 0 && <span>{perPlayer} slots/player {isEven ? <span style={{ color: "#4ade80", fontWeight: 700 }}>= EQUAL</span> : ""}</span>}
+              </div>
+            );
+          })()}
         </div>
         {/* GK Selection */}
         {cc >= 9 && (() => {
@@ -1460,7 +1516,7 @@ function SoccerApp() {
                     color: "#fcd34d", cursor: "pointer", textTransform: "uppercase", letterSpacing: 0.5
                   }}>Manual Sub</button>
                 )}
-                <span style={{ fontSize: 11, color: "rgba(255,255,255,0.4)", fontWeight: 700 }}>{slot.slotIndex + 1}/10</span>
+                <span style={{ fontSize: 11, color: "rgba(255,255,255,0.4)", fontWeight: 700 }}>{slot.slotIndex + 1}/{slots.length}</span>
               </div>
             </div>
 
