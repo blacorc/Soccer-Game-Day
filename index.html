@@ -701,7 +701,7 @@ function generateSchedule(attendees, seed = 0, selectedGoalies = null, gameConfi
       slotsPlayed: totalOnPitch,
       gkSlots,
       fieldSlots,
-      totalMinutes: totalOnPitch * 5,
+      totalMinutes: totalOnPitch * cfg.interval,
       positionsUsed: [...posUsed],
     };
   });
@@ -1035,7 +1035,7 @@ function applyManualSubAndRegenerate(currentSchedule, attendees, slotIndex, play
     const fieldSlots = grid[i].filter(v => v === "FIELD").length;
     const posUsed = new Set();
     slotsOutput.forEach(sl => { if (sl.positions[p.id]) posUsed.add(sl.positions[p.id]); });
-    return { ...p, slotsPlayed: totalOnPitch, gkSlots, fieldSlots, totalMinutes: totalOnPitch * 5, positionsUsed: [...posUsed] };
+    return { ...p, slotsPlayed: totalOnPitch, gkSlots, fieldSlots, totalMinutes: totalOnPitch * cfg.interval, positionsUsed: [...posUsed] };
   });
 
   return { slots: slotsOutput, summary, error: null };
