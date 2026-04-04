@@ -156,7 +156,7 @@ function assignFieldPositions(fieldPlayers) {
 
 // ─── MAIN SCHEDULE GENERATOR ─────────────────────────────────
 
-function generateSchedule(attendees, seed = 0, selectedGoalies = null, gameConfig = null) {
+function generateSchedule(attendees, seed = 0, selectedGoalies = null, gameConfig = null, startingLineup = null) {
   try {
   const cfg = gameConfig || { firstHalfMin: 25, secondHalfMin: 25, interval: 5 };
   const FIRST_HALF_SLOTS = Math.max(1, Math.round(cfg.firstHalfMin / cfg.interval));
@@ -287,7 +287,13 @@ function generateSchedule(attendees, seed = 0, selectedGoalies = null, gameConfi
       return { idx: i, need: remaining, urgency: remaining / slotsRemaining };
     });
 
-    if (s === 0 || s === HALFTIME) {
+    if (s === 0 && startingLineup) {
+      // Use coach-set starting lineup — lock in exactly who the coach picked
+      for (const pid of Object.keys(startingLineup.positions)) {
+        const idx = playerIdx[parseInt(pid)];
+        if (idx !== undefined && idx !== gkIdx) grid[idx][s] = "FIELD";
+      }
+    } else if (s === 0 || s === HALFTIME) {
       // Fresh lineup (kickoff or halftime reset)
       need.sort((a, b) => {
         if (b.urgency !== a.urgency) return b.urgency - a.urgency;
@@ -578,7 +584,12 @@ function generateSchedule(attendees, seed = 0, selectedGoalies = null, gameConfi
       comingOff = [...prevOnPitch].filter(id => !currOnPitch.has(id)).map(id => ALL.find(p => p.id === id)).filter(Boolean);
     }
 
-    if (s === 0 || s === HALFTIME) {
+    if (s === 0 && startingLineup) {
+      // Use coach-set positions directly
+      for (const [pid, pos] of Object.entries(startingLineup.positions)) {
+        positions[parseInt(pid)] = pos;
+      }
+    } else if (s === 0 || s === HALFTIME) {
       // Fresh assignment from scratch
       positions = assignFieldPositions(fieldPlayers);
     } else {
@@ -1203,6 +1214,8 @@ function SoccerApp() {
   const [manualSubSlot, setManualSubSlot] = useState(null); // slot index being edited
   const [subOffId, setSubOffId] = useState(null);
   const [subOnId, setSubOnId] = useState(null);
+  const [lineupSlots, setLineupSlots] = useState({ DEF: [null, null, null], MID: [null, null, null], FWD: [null, null] });
+  const [lineupPicking, setLineupPicking] = useState(null); // { pos, idx }
 
   const [newName, setNewName] = useState("");
   const [newTier, setNewTier] = useState("B");
@@ -1241,10 +1254,31 @@ function SoccerApp() {
   }, []);
   const checkInAll = useCallback(() => setCheckedIn(new Set(roster.map(p => p.id))), [roster]);
 
+  // Reset lineup when check-in changes (unchecked player may be in lineup)
+  useEffect(() => {
+    setLineupSlots({ DEF: [null, null, null], MID: [null, null, null], FWD: [null, null] });
+    setLineupPicking(null);
+    setSelectedGK1(null);
+    setSelectedGK2(null);
+  }, [checkedIn]);
+
   const selectedGoalies = useMemo(() => {
     if (selectedGK1 && selectedGK2) return { firstHalf: selectedGK1, secondHalf: selectedGK2 };
     return null;
   }, [selectedGK1, selectedGK2]);
+
+  const startingLineupForAlgo = useMemo(() => {
+    if (!selectedGK1) return null;
+    const allFilled = lineupSlots.DEF.every(id => id !== null) &&
+                      lineupSlots.MID.every(id => id !== null) &&
+                      lineupSlots.FWD.every(id => id !== null);
+    if (!allFilled) return null;
+    const positions = {};
+    lineupSlots.DEF.forEach(id => { if (id) positions[id] = "DEF"; });
+    lineupSlots.MID.forEach(id => { if (id) positions[id] = "MID"; });
+    lineupSlots.FWD.forEach(id => { if (id) positions[id] = "FWD"; });
+    return { gkId: selectedGK1, positions };
+  }, [selectedGK1, lineupSlots]);
 
   const gameConfig = useMemo(() => ({
     firstHalfMin, secondHalfMin, interval: subInterval
@@ -1252,20 +1286,20 @@ function SoccerApp() {
 
   const generateRotation = useCallback(() => {
     const attendees = roster.filter(p => checkedIn.has(p.id));
-    const result = generateSchedule(attendees, seed, selectedGoalies, gameConfig);
+    const result = generateSchedule(attendees, seed, selectedGoalies, gameConfig, startingLineupForAlgo);
     setScheduleData(result);
     setManualSubSlot(null);
     if (!result.error) setScreen("schedule");
-  }, [roster, checkedIn, seed, selectedGoalies, gameConfig]);
+  }, [roster, checkedIn, seed, selectedGoalies, gameConfig, startingLineupForAlgo]);
 
   const reshuffle = useCallback(() => {
     const newSeed = seed + 1;
     setSeed(newSeed);
     const attendees = roster.filter(p => checkedIn.has(p.id));
-    const result = generateSchedule(attendees, newSeed, selectedGoalies, gameConfig);
+    const result = generateSchedule(attendees, newSeed, selectedGoalies, gameConfig, startingLineupForAlgo);
     setScheduleData(result);
     setManualSubSlot(null);
-  }, [roster, checkedIn, seed, selectedGoalies, gameConfig]);
+  }, [roster, checkedIn, seed, selectedGoalies, gameConfig, startingLineupForAlgo]);
 
   const applyManualSub = useCallback(() => {
     if (manualSubSlot === null || !subOffId || !subOnId || !scheduleData) return;
@@ -1351,7 +1385,8 @@ function SoccerApp() {
   const renderGameDay = () => {
     const cc = checkedIn.size;
     const hasGk = roster.some(p => checkedIn.has(p.id) && (p.positions.primary === "GK" || p.positions.secondary.includes("GK")));
-    const ready = cc >= 9 && hasGk;
+    const lineupComplete = startingLineupForAlgo !== null;
+    const ready = cc >= 9 && hasGk && selectedGK1 && selectedGK2 && lineupComplete;
 
     return (
       <div>
@@ -1408,18 +1443,18 @@ function SoccerApp() {
             );
           })()}
         </div>
-        {/* GK Selection */}
+        {/* Step 2: Goalkeeper Selection — shown once 9+ checked in */}
         {cc >= 9 && (() => {
           const gkEligible = roster.filter(p => checkedIn.has(p.id) && (p.positions.primary === "GK" || p.positions.secondary.includes("GK")));
           return (
             <div style={S.card}>
-              <div style={{ fontSize: 13, fontWeight: 700, color: "#60a5fa", marginBottom: 10 }}>Goalkeeper Selection</div>
+              <div style={{ fontSize: 13, fontWeight: 700, color: "#60a5fa", marginBottom: 10 }}>Goalkeepers</div>
               <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
                 <div>
                   <span style={S.lbl}>1st Half GK</span>
                   <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
                     {gkEligible.map(p => (
-                      <button key={p.id} onClick={() => setSelectedGK1(p.id)} style={{
+                      <button key={p.id} onClick={() => setSelectedGK1(selectedGK1 === p.id ? null : p.id)} style={{
                         padding: "8px 14px", borderRadius: 8, fontSize: 13, fontWeight: 600, cursor: "pointer",
                         border: selectedGK1 === p.id ? "2px solid #60a5fa" : "1px solid rgba(255,255,255,0.12)",
                         background: selectedGK1 === p.id ? "rgba(96,165,250,0.15)" : "rgba(0,0,0,0.25)",
@@ -1435,7 +1470,7 @@ function SoccerApp() {
                   <span style={S.lbl}>2nd Half GK</span>
                   <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
                     {gkEligible.map(p => (
-                      <button key={p.id} onClick={() => setSelectedGK2(p.id)} style={{
+                      <button key={p.id} onClick={() => setSelectedGK2(selectedGK2 === p.id ? null : p.id)} style={{
                         padding: "8px 14px", borderRadius: 8, fontSize: 13, fontWeight: 600, cursor: "pointer",
                         border: selectedGK2 === p.id ? "2px solid #60a5fa" : "1px solid rgba(255,255,255,0.12)",
                         background: selectedGK2 === p.id ? "rgba(96,165,250,0.15)" : "rgba(0,0,0,0.25)",
@@ -1447,19 +1482,116 @@ function SoccerApp() {
                     ))}
                   </div>
                 </div>
-                {!selectedGK1 || !selectedGK2 ? (
-                  <div style={{ padding: "6px 10px", borderRadius: 6, background: "rgba(96,165,250,0.08)", border: "1px solid rgba(96,165,250,0.15)", fontSize: 11, color: "#93c5fd" }}>
-                    Select a GK for each half, or leave unselected for auto-assign
-                  </div>
-                ) : null}
               </div>
             </div>
           );
         })()}
+
+        {/* Step 3: Starting Lineup — shown once both GKs are picked */}
+        {cc >= 9 && selectedGK1 && selectedGK2 && (() => {
+          const gkIds = new Set([selectedGK1, selectedGK2]);
+          const assignedIds = new Set([
+            ...lineupSlots.DEF.filter(Boolean),
+            ...lineupSlots.MID.filter(Boolean),
+            ...lineupSlots.FWD.filter(Boolean),
+          ]);
+          const filled = lineupSlots.DEF.filter(Boolean).length + lineupSlots.MID.filter(Boolean).length + lineupSlots.FWD.filter(Boolean).length;
+          const remaining = 8 - filled;
+
+          const getAvailable = (pos, idx) => {
+            const currentId = lineupSlots[pos][idx];
+            return roster.filter(p =>
+              checkedIn.has(p.id) &&
+              !gkIds.has(p.id) &&
+              (!assignedIds.has(p.id) || p.id === currentId)
+            );
+          };
+
+          const setSlot = (pos, idx, playerId) => {
+            setLineupSlots(prev => { const n = { ...prev, [pos]: [...prev[pos]] }; n[pos][idx] = playerId; return n; });
+            setLineupPicking(null);
+          };
+
+          const clearSlot = (pos, idx) => {
+            setLineupSlots(prev => { const n = { ...prev, [pos]: [...prev[pos]] }; n[pos][idx] = null; return n; });
+            setLineupPicking(null);
+          };
+
+          const getName = id => id ? (roster.find(p => p.id === id)?.name || "?") : null;
+          const gk1Name = roster.find(p => p.id === selectedGK1)?.name;
+
+          const SECTIONS = [
+            { key: "DEF", label: "DEF", count: 3, color: "#4ade80" },
+            { key: "MID", label: "MID", count: 3, color: "#60a5fa" },
+            { key: "FWD", label: "FWD", count: 2, color: "#fb923c" },
+          ];
+
+          return (
+            <div style={S.card}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+                <div style={{ fontSize: 13, fontWeight: 700, color: "#f0f9f0" }}>Starting Lineup</div>
+                {remaining > 0
+                  ? <div style={{ fontSize: 11, color: "#fcd34d" }}>{remaining} left</div>
+                  : <div style={{ fontSize: 11, color: "#4ade80", fontWeight: 700 }}>✓ Complete</div>}
+              </div>
+              <div style={{ fontSize: 11, color: "rgba(255,255,255,0.3)", marginBottom: 12 }}>GK: {gk1Name}</div>
+              {SECTIONS.map(({ key, label, count, color }) => (
+                <div key={key} style={{ marginBottom: 12 }}>
+                  <span style={{ ...S.lbl, color }}>{label}</span>
+                  <div style={{ display: "flex", gap: 6 }}>
+                    {Array.from({ length: count }, (_, idx) => {
+                      const assignedId = lineupSlots[key][idx];
+                      const playerName = getName(assignedId);
+                      const isPicking = lineupPicking?.pos === key && lineupPicking?.idx === idx;
+                      return (
+                        <div key={idx} style={{ flex: 1 }}>
+                          <button
+                            onClick={() => {
+                              if (assignedId) { clearSlot(key, idx); }
+                              else { setLineupPicking(isPicking ? null : { pos: key, idx }); }
+                            }}
+                            style={{
+                              width: "100%", padding: "9px 4px", borderRadius: 8, fontSize: 12, fontWeight: 600, cursor: "pointer", textAlign: "center",
+                              border: assignedId ? `1px solid ${color}60` : isPicking ? `1px solid ${color}` : "1px solid rgba(255,255,255,0.12)",
+                              background: assignedId ? `${color}18` : isPicking ? `${color}10` : "rgba(0,0,0,0.3)",
+                              color: assignedId ? color : isPicking ? color : "rgba(255,255,255,0.25)",
+                            }}
+                          >
+                            {playerName || (isPicking ? "…" : `${label}${idx + 1}`)}
+                          </button>
+                          {isPicking && (
+                            <div style={{ position: "relative", zIndex: 10, marginTop: 3, padding: 6, background: "#0d2818", borderRadius: 8, border: `1px solid ${color}40`, boxShadow: "0 4px 16px rgba(0,0,0,0.6)" }}>
+                              {getAvailable(key, idx).map(p => (
+                                <button key={p.id} onClick={() => setSlot(key, idx, p.id)} style={{
+                                  display: "block", width: "100%", padding: "7px 10px", marginBottom: 2, borderRadius: 6,
+                                  fontSize: 12, fontWeight: 600, textAlign: "left", cursor: "pointer",
+                                  border: "1px solid rgba(255,255,255,0.06)", background: "rgba(255,255,255,0.03)", color: "#e0f2e0",
+                                }}>
+                                  {p.name} <span style={{ fontSize: 10, opacity: 0.4 }}>{p.positions.primary}</span>
+                                </button>
+                              ))}
+                              {getAvailable(key, idx).length === 0 && (
+                                <div style={{ fontSize: 11, color: "rgba(255,255,255,0.3)", padding: "4px 6px" }}>No players available</div>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              ))}
+            </div>
+          );
+        })()}
+
+        {/* Generate button */}
         <div style={S.card}>
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
             {!hasGk && cc > 0 && <div style={{ padding: "8px 10px", borderRadius: 8, background: "rgba(239,68,68,0.08)", border: "1px solid rgba(239,68,68,0.15)", fontSize: 12, color: "#fca5a5" }}>⚠ No GK-eligible player checked in</div>}
             {cc < 9 && cc > 0 && <div style={{ padding: "8px 10px", borderRadius: 8, background: "rgba(245,158,11,0.08)", border: "1px solid rgba(245,158,11,0.15)", fontSize: 12, color: "#fcd34d" }}>Need ≥ 9 players ({cc} checked)</div>}
+            {cc >= 9 && hasGk && (!selectedGK1 || !selectedGK2) && <div style={{ padding: "8px 10px", borderRadius: 8, background: "rgba(96,165,250,0.08)", border: "1px solid rgba(96,165,250,0.15)", fontSize: 12, color: "#93c5fd" }}>Select both goalkeepers above</div>}
+            {cc >= 9 && selectedGK1 && selectedGK2 && !lineupComplete && <div style={{ padding: "8px 10px", borderRadius: 8, background: "rgba(96,165,250,0.08)", border: "1px solid rgba(96,165,250,0.15)", fontSize: 12, color: "#93c5fd" }}>Fill all 8 field positions above</div>}
             {scheduleData?.error && <div style={{ padding: "8px 10px", borderRadius: 8, background: "rgba(239,68,68,0.08)", border: "1px solid rgba(239,68,68,0.15)", fontSize: 12, color: "#fca5a5" }}>{scheduleData.error}</div>}
             <button style={{ ...S.btn, opacity: ready ? 1 : 0.35, cursor: ready ? "pointer" : "not-allowed" }} onClick={generateRotation} disabled={!ready}>Generate Rotation</button>
           </div>
