@@ -1415,15 +1415,15 @@ function SoccerApp() {
           <div style={{ display: "flex", gap: 10 }}>
             <div style={{ flex: 1 }}>
               <span style={S.lbl}>1st Half (min)</span>
-              <input type="number" min="5" max="60" step="1" value={firstHalfMin} onChange={e => setFirstHalfMin(Math.max(5, parseInt(e.target.value) || 5))} style={{ ...S.input, textAlign: "center", fontSize: 18, fontWeight: 700 }} />
+              <input type="number" min="5" max="60" step="1" value={firstHalfMin} onChange={e => setFirstHalfMin(parseInt(e.target.value) || '')} onBlur={() => setFirstHalfMin(v => Math.max(5, parseInt(v) || 5))} style={{ ...S.input, textAlign: "center", fontSize: 18, fontWeight: 700 }} />
             </div>
             <div style={{ flex: 1 }}>
               <span style={S.lbl}>2nd Half (min)</span>
-              <input type="number" min="5" max="60" step="1" value={secondHalfMin} onChange={e => setSecondHalfMin(Math.max(5, parseInt(e.target.value) || 5))} style={{ ...S.input, textAlign: "center", fontSize: 18, fontWeight: 700 }} />
+              <input type="number" min="5" max="60" step="1" value={secondHalfMin} onChange={e => setSecondHalfMin(parseInt(e.target.value) || '')} onBlur={() => setSecondHalfMin(v => Math.max(5, parseInt(v) || 5))} style={{ ...S.input, textAlign: "center", fontSize: 18, fontWeight: 700 }} />
             </div>
             <div style={{ flex: 1 }}>
               <span style={S.lbl}>Sub Interval</span>
-              <input type="number" min="3" max="15" step="1" value={subInterval} onChange={e => setSubInterval(Math.max(3, parseInt(e.target.value) || 5))} style={{ ...S.input, textAlign: "center", fontSize: 18, fontWeight: 700 }} />
+              <input type="number" min="3" max="15" step="1" value={subInterval} onChange={e => setSubInterval(parseInt(e.target.value) || '')} onBlur={() => setSubInterval(v => Math.max(3, parseInt(v) || 3))} style={{ ...S.input, textAlign: "center", fontSize: 18, fontWeight: 700 }} />
             </div>
           </div>
           {(() => {
