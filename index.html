@@ -445,6 +445,7 @@ function generateSchedule(attendees, seed = 0, selectedGoalies = null, gameConfi
       if (counts[i] > targetHigh) {
         // Over target — swap out of a FIELD slot with an under-target bench player
         for (let s = 0; s < SLOTS; s++) {
+          if (startingLineup && s === 0) continue; // never touch coach-set slot 0
           if (grid[i][s] !== "FIELD") continue;
           for (let j = 0; j < N; j++) {
             if (j === i || grid[j][s] !== null) continue;
@@ -461,6 +462,7 @@ function generateSchedule(attendees, seed = 0, selectedGoalies = null, gameConfi
         }
       } else if (counts[i] < targetLow) {
         for (let s = 0; s < SLOTS; s++) {
+          if (startingLineup && s === 0) continue; // never touch coach-set slot 0
           if (grid[i][s] !== null) continue;
           if (i === playerIdx[gkSchedule[s].id]) continue;
           for (let j = 0; j < N; j++) {
@@ -484,6 +486,7 @@ function generateSchedule(attendees, seed = 0, selectedGoalies = null, gameConfi
     let improved = false;
     const counts = pitchCount();
     for (let s = 0; s < SLOTS; s++) {
+      if (startingLineup && s === 0) continue; // never touch coach-set slot 0
       const fieldIds = [];
       for (let i = 0; i < N; i++) {
         if (grid[i][s] === "FIELD") fieldIds.push(i);
