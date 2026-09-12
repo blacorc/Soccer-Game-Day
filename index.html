@@ -720,7 +720,7 @@ function generateSchedule(attendees, seed = 0, selectedGoalies = null, gameConfi
     };
   });
 
-  return { slots: slotsOutput, summary, error: null };
+  return { slots: slotsOutput, summary, error: null, config: cfg };
   } catch (e) {
     console.error("Schedule generation error:", e);
     return { error: "Schedule generation failed: " + e.message, slots: [], summary: [] };
@@ -739,6 +739,13 @@ function applyManualSubAndRegenerate(currentSchedule, attendees, slotIndex, play
   const ALL = [...attendees];
   const N = ALL.length;
   const SLOTS = FIRST_HALF_SLOTS + SECOND_HALF_SLOTS;
+
+  // The locked slots are read straight out of the on-screen schedule, so the
+  // game settings must still match the ones it was generated with.
+  if (!currentSchedule || !currentSchedule.slots || currentSchedule.slots.length !== SLOTS) {
+    return { error: "Game settings changed since this schedule was generated — regenerate the rotation first.", slots: [], summary: [] };
+  }
+
   const ON_PITCH = 9;
   const FIELD_SPOTS = 8;
   const SUBS = 3;
@@ -969,7 +976,41 @@ function applyManualSubAndRegenerate(currentSchedule, attendees, slotIndex, play
       comingOff = [...prevOnPitch].filter(id => !currOnPitch.has(id)).map(id => ALL.find(p => p.id === id)).filter(Boolean);
     }
 
-    if (s === 0 || s === HALFTIME) {
+    if (s <= slotIndex) {
+      // Locked slot — reproduce the positions already on screen rather than
+      // reassigning, so a coach-set starting lineup (and every position the
+      // coach has watched so far) survives the sub.
+      positions = { ...(currentSchedule.slots[s].positions || {}) };
+      if (s === slotIndex) {
+        // Incoming player inherits the outgoing player's position.
+        const offPos = positions[playerOffId];
+        delete positions[playerOffId];
+        if (offPos && offPos !== "GK") positions[playerOnId] = offPos;
+      }
+      // Drop anyone no longer on the pitch, then backfill any gap.
+      const onPitchIds = new Set([gkPlayer.id, ...fieldPlayers.map(p => p.id)]);
+      for (const id of Object.keys(positions)) {
+        if (!onPitchIds.has(Number(id))) delete positions[id];
+      }
+      const missing = fieldPlayers.filter(p => !positions[p.id]);
+      if (missing.length > 0) {
+        const remaining = { DEF: 3, MID: 3, FWD: 2 };
+        for (const id in positions) {
+          if (positions[id] !== "GK" && remaining[positions[id]] !== undefined) remaining[positions[id]]--;
+        }
+        for (const p of missing) {
+          let done = false;
+          for (const pos of ["DEF", "MID", "FWD"]) {
+            if (remaining[pos] > 0 && canPlayField(p, pos)) { positions[p.id] = pos; remaining[pos]--; done = true; break; }
+          }
+          if (!done) {
+            for (const pos of ["DEF", "MID", "FWD"]) {
+              if (remaining[pos] > 0) { positions[p.id] = pos; remaining[pos]--; break; }
+            }
+          }
+        }
+      }
+    } else if (s === HALFTIME) {
       positions = assignFieldPositions(fieldPlayers);
     } else {
       const vacatedPositions = [];
@@ -1052,7 +1093,7 @@ function applyManualSubAndRegenerate(currentSchedule, attendees, slotIndex, play
     return { ...p, slotsPlayed: totalOnPitch, gkSlots, fieldSlots, totalMinutes: totalOnPitch * cfg.interval, positionsUsed: [...posUsed] };
   });
 
-  return { slots: slotsOutput, summary, error: null };
+  return { slots: slotsOutput, summary, error: null, config: cfg };
   } catch (e) {
     console.error("Regeneration error:", e);
     return { error: "Regeneration failed: " + e.message, slots: [], summary: [] };
@@ -1307,7 +1348,11 @@ function SoccerApp() {
   const applyManualSub = useCallback(() => {
     if (manualSubSlot === null || !subOffId || !subOnId || !scheduleData) return;
     const attendees = roster.filter(p => checkedIn.has(p.id));
-    const result = applyManualSubAndRegenerate(scheduleData, attendees, manualSubSlot, subOffId, subOnId, selectedGoalies, gameConfig);
+    // Sub against the settings this schedule was generated with, not whatever
+    // is currently typed into Game Settings.
+    const cfg = scheduleData.config || gameConfig;
+    const result = applyManualSubAndRegenerate(scheduleData, attendees, manualSubSlot, subOffId, subOnId, selectedGoalies, cfg);
+    if (result.error) { window.alert(result.error); return; }
     setScheduleData(result);
     setManualSubSlot(null);
     setSubOffId(null);
