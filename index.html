@@ -1100,6 +1100,164 @@ function applyManualSubAndRegenerate(currentSchedule, attendees, slotIndex, play
   }
 }
 
+/* ============================================================
+ * LIVE GAME ENGINE
+ * ============================================================
+ * The planner above answers "what should the game look like".
+ * This answers "what has actually happened so far".
+ *
+ * Truth is an append-only event log with game-clock timestamps.
+ * Playing time is DERIVED by replaying it, never stored as fact,
+ * so a sub entered late — or back-dated afterwards — is absorbed
+ * instead of corrupting the record.
+ *
+ * Fair share at elapsed time T is (ON_PITCH * T) / present.
+ * debt = fairShare - accrued. Positive means the player is owed
+ * time. That single number drives every suggestion.
+ * ============================================================ */
+
+const LIVE_KEY = "pitchManagerLiveGame";
+
+function fmtClock(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+
+function fmtSigned(ms) {
+  const s = Math.round(ms / 1000);
+  const a = Math.abs(s);
+  return `${s < 0 ? "−" : "+"}${Math.floor(a / 60)}:${String(a % 60).padStart(2, "0")}`;
+}
+
+// Current game-clock position, in ms.
+function liveNow(live) {
+  if (!live) return 0;
+  return live.resumedAt ? live.clockBase + (Date.now() - live.resumedAt) : live.clockBase;
+}
+
+/* Replay the log to derive accrued time, who is on, and positions.
+ * Full replay every time: a game has well under a hundred events, and
+ * it keeps edited timestamps honest without any incremental bookkeeping. */
+function replayGame(live, nowT) {
+  const accrued = {};
+  (live.present || []).forEach(id => { accrued[id] = 0; });
+  let onPitch = new Set();
+  let positions = {};
+  let running = false;
+  let lastT = 0;
+
+  const sorted = [...(live.events || [])].sort((a, b) => (a.t - b.t) || (a.seq - b.seq));
+  for (const e of sorted) {
+    if (running && e.t > lastT) {
+      for (const id of onPitch) if (accrued[id] !== undefined) accrued[id] += e.t - lastT;
+    }
+    if (e.t > lastT) lastT = e.t;
+
+    if (e.type === "start") {
+      onPitch = new Set(e.lineup);
+      positions = { ...e.positions };
+      running = true;
+    } else if (e.type === "pause" || e.type === "end") {
+      running = false;
+    } else if (e.type === "resume") {
+      running = true;
+    } else if (e.type === "sub") {
+      const pos = e.pos || positions[e.off];
+      onPitch.delete(e.off);
+      onPitch.add(e.on);
+      delete positions[e.off];
+      if (pos) positions[e.on] = pos;
+    }
+  }
+  if (running && nowT > lastT) {
+    for (const id of onPitch) if (accrued[id] !== undefined) accrued[id] += nowT - lastT;
+  }
+  return { accrued, onPitch, positions, running };
+}
+
+/* Per-player ledger, most-owed first. */
+function buildLedger(live, nowT, rosterById) {
+  const { accrued, onPitch, positions } = replayGame(live, nowT);
+  const present = live.present || [];
+  const N = present.length || 1;
+  const fairShare = (9 * nowT) / N;
+
+  return present.map(id => {
+    const acc = accrued[id] || 0;
+    return {
+      id,
+      player: rosterById[id],
+      accrued: acc,
+      debt: fairShare - acc,
+      on: onPitch.has(id),
+      pos: positions[id] || null,
+    };
+  }).sort((a, b) => b.debt - a.debt);
+}
+
+/* Suggested swaps. Ranked by how much they close the gap, filtered so we
+ * never propose something the coach would obviously reject: no pulling a
+ * player who just came on, no putting someone somewhere they can't play. */
+function suggestSubs(live, nowT, rosterById, opts = {}) {
+  const minStintMs = opts.minStintMs !== undefined ? opts.minStintMs : 120000;
+  const ledger = buildLedger(live, nowT, rosterById);
+  const { positions } = replayGame(live, nowT);
+
+  // When did each on-pitch player last come on?
+  const cameOnAt = {};
+  for (const e of [...(live.events || [])].sort((a, b) => a.t - b.t)) {
+    if (e.type === "start") e.lineup.forEach(id => { cameOnAt[id] = e.t; });
+    else if (e.type === "sub") cameOnAt[e.on] = e.t;
+  }
+
+  const gkId = Object.keys(positions).find(id => positions[id] === "GK");
+  const onField = ledger.filter(l => l.on && String(l.id) !== String(gkId));
+  const bench = ledger.filter(l => !l.on);
+
+  // Most over-served first, but only those past their minimum stint.
+  const offCandidates = onField
+    .filter(l => (nowT - (cameOnAt[l.id] || 0)) >= minStintMs)
+    .sort((a, b) => a.debt - b.debt);
+
+  const pairs = [];
+  const usedOn = new Set();
+  const usedOff = new Set();
+
+  for (const off of offCandidates) {
+    if (off.debt >= 0) continue; // not actually over-served
+    const pos = off.pos;
+    const on = bench.find(b =>
+      !usedOn.has(b.id) &&
+      b.debt > 0 &&
+      b.player && canPlayField(b.player, pos)
+    );
+    if (!on) continue;
+    usedOn.add(on.id);
+    usedOff.add(off.id);
+    pairs.push({
+      off, on, pos,
+      gain: on.debt - off.debt,
+      stintMs: nowT - (cameOnAt[off.id] || 0),
+    });
+    if (pairs.length >= 3) break;
+  }
+  pairs.sort((a, b) => b.gain - a.gain);
+  return { pairs, ledger, cameOnAt };
+}
+
+/* Light driving: one passive line, never an alarm. */
+function liveNudge(ledger, nowT) {
+  if (nowT < 60000) return null;
+  const owed = ledger.filter(l => !l.on && l.debt > 180000);
+  if (owed.length === 0) return null;
+  const worst = Math.max(...owed.map(l => l.debt));
+  return {
+    count: owed.length,
+    worst,
+    names: owed.slice(0, 3).map(l => l.player && l.player.name).filter(Boolean),
+  };
+}
+
 // ─── FIELD SVG ───────────────────────────────────────────────
 function FieldGraphic({ slot }) {
   const { gk, onField, positions, comingOn, comingOff, bench, gkChanged } = slot;
@@ -1260,6 +1418,131 @@ function SoccerApp() {
   const [subOnId, setSubOnId] = useState(null);
   const [lineupSlots, setLineupSlots] = useState({ DEF: [null, null, null], MID: [null, null, null], FWD: [null, null] });
   const [lineupPicking, setLineupPicking] = useState(null); // { pos, idx }
+
+  // ── LIVE GAME ──
+  const [live, setLive] = useState(() => {
+    try {
+      const saved = localStorage.getItem(LIVE_KEY);
+      if (saved) return JSON.parse(saved);
+    } catch (e) {}
+    return null;
+  });
+  const [tick, setTick] = useState(0);
+  const [liveSubOff, setLiveSubOff] = useState(null); // player id being subbed off
+  const [showLog, setShowLog] = useState(false);
+
+  // A live game must survive a refresh, a locked phone, a dropped tab.
+  useEffect(() => {
+    try {
+      if (live) localStorage.setItem(LIVE_KEY, JSON.stringify(live));
+      else localStorage.removeItem(LIVE_KEY);
+    } catch (e) {}
+  }, [live]);
+
+  // Re-render the clock while it runs.
+  useEffect(() => {
+    if (!live || !live.resumedAt) return;
+    const h = setInterval(() => setTick(t => t + 1), 500);
+    return () => clearInterval(h);
+  }, [live && live.resumedAt]);
+
+  // Keep the screen awake on the sideline.
+  useEffect(() => {
+    if (!live || !live.resumedAt || !navigator.wakeLock) return;
+    let sentinel = null, cancelled = false;
+    navigator.wakeLock.request("screen").then(s => {
+      if (cancelled) { s.release().catch(() => {}); return; }
+      sentinel = s;
+    }).catch(() => {});
+    return () => { cancelled = true; if (sentinel) sentinel.release().catch(() => {}); };
+  }, [live && live.resumedAt]);
+
+  const nextSeq = useCallback((l) => (l && l.events.length ? Math.max(...l.events.map(e => e.seq)) + 1 : 1), []);
+
+  const pushEvent = useCallback((evt) => {
+    setLive(prev => {
+      if (!prev) return prev;
+      const t = evt.t !== undefined ? evt.t : liveNow(prev);
+      return { ...prev, events: [...prev.events, { ...evt, t, seq: nextSeq(prev) }] };
+    });
+  }, [nextSeq]);
+
+  const startLiveGame = useCallback(() => {
+    if (!scheduleData || scheduleData.error || !scheduleData.slots.length) return;
+    const s0 = scheduleData.slots[0];
+    const lineup = [s0.gk.id, ...s0.onField.map(p => p.id)];
+    const attendees = roster.filter(p => checkedIn.has(p.id));
+    setLive({
+      present: attendees.map(p => p.id),
+      events: [{ t: 0, seq: 0, type: "start", lineup, positions: { ...s0.positions } }],
+      clockBase: 0,
+      resumedAt: Date.now(),
+      ended: false,
+    });
+    setScreen("live");
+  }, [scheduleData, roster, checkedIn]);
+
+  const toggleClock = useCallback(() => {
+    setLive(prev => {
+      if (!prev || prev.ended) return prev;
+      const now = liveNow(prev);
+      const seq = nextSeq(prev);
+      if (prev.resumedAt) {
+        return { ...prev, clockBase: now, resumedAt: null, events: [...prev.events, { t: now, seq, type: "pause" }] };
+      }
+      return { ...prev, resumedAt: Date.now(), events: [...prev.events, { t: now, seq, type: "resume" }] };
+    });
+  }, [nextSeq]);
+
+  const applyLiveSub = useCallback((offId, onId, pos) => {
+    setLive(prev => {
+      if (!prev) return prev;
+      const t = liveNow(prev);
+      const { positions } = replayGame(prev, t);
+      return {
+        ...prev,
+        events: [...prev.events, { t, seq: nextSeq(prev), type: "sub", off: offId, on: onId, pos: pos || positions[offId] }],
+      };
+    });
+    setLiveSubOff(null);
+  }, [nextSeq]);
+
+  // Back-dating: the whole point of an event log. Nudge any sub's timestamp.
+  const nudgeEventTime = useCallback((seq, deltaMs) => {
+    setLive(prev => {
+      if (!prev) return prev;
+      const now = liveNow(prev);
+      return {
+        ...prev,
+        events: prev.events.map(e =>
+          e.seq === seq ? { ...e, t: Math.max(0, Math.min(now, e.t + deltaMs)) } : e
+        ),
+      };
+    });
+  }, []);
+
+  const undoLastEvent = useCallback(() => {
+    setLive(prev => {
+      if (!prev || prev.events.length <= 1) return prev;
+      const evts = [...prev.events];
+      evts.pop();
+      return { ...prev, events: evts };
+    });
+  }, []);
+
+  const endLiveGame = useCallback(() => {
+    setLive(prev => {
+      if (!prev) return prev;
+      const now = liveNow(prev);
+      return { ...prev, clockBase: now, resumedAt: null, ended: true, events: [...prev.events, { t: now, seq: nextSeq(prev), type: "end" }] };
+    });
+  }, [nextSeq]);
+
+  const discardLiveGame = useCallback(() => {
+    if (!window.confirm("Discard this live game and its record? This cannot be undone.")) return;
+    setLive(null);
+    setScreen("schedule");
+  }, []);
 
   const [newName, setNewName] = useState("");
   const [newTier, setNewTier] = useState("B");
@@ -1678,6 +1961,17 @@ function SoccerApp() {
           }}>↻ Reshuffle</button>
         </div>
 
+        <div style={{ margin: "10px 12px" }}>
+          <button onClick={startLiveGame} style={{
+            width: "100%", padding: "13px", borderRadius: 10, border: "none",
+            background: "linear-gradient(135deg, #22c55e, #15803d)", color: "white",
+            fontSize: 14, fontWeight: 800, cursor: "pointer", textTransform: "uppercase", letterSpacing: 0.6,
+          }}>▶ Start Live Game</button>
+          <div style={{ marginTop: 5, fontSize: 10, color: "rgba(255,255,255,0.3)", textAlign: "center" }}>
+            Starts the clock from this lineup. The plan becomes a suggestion.
+          </div>
+        </div>
+
         {slots.map(slot => (
           <div key={slot.slotIndex} style={{ ...S.card, borderColor: slot.isLocked ? "rgba(245,158,11,0.2)" : "rgba(255,255,255,0.1)" }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
@@ -1803,6 +2097,221 @@ function SoccerApp() {
     );
   };
 
+  // ── LIVE SCREEN ──
+  const renderLive = () => {
+    if (!live) {
+      const canStart = scheduleData && !scheduleData.error && scheduleData.slots.length > 0;
+      return (
+        <div style={S.card}>
+          <div style={{ fontSize: 13, fontWeight: 700, color: "#4ade80", marginBottom: 8 }}>Live Game</div>
+          <div style={{ fontSize: 12, color: "rgba(255,255,255,0.45)", lineHeight: 1.6, marginBottom: 12 }}>
+            Tracks the real clock and who is actually on the pitch. Subs are recorded when
+            you make them, not when a plan says to — and you can correct the time afterwards.
+            The plan becomes a suggestion, not a schedule.
+          </div>
+          {canStart ? (
+            <button style={S.btn} onClick={startLiveGame}>▶ Start from Current Plan</button>
+          ) : (
+            <div style={{ padding: "10px 12px", borderRadius: 8, background: "rgba(245,158,11,0.08)", border: "1px solid rgba(245,158,11,0.15)", fontSize: 12, color: "#fcd34d" }}>
+              Generate a rotation on the Game Day tab first — the starting lineup seeds the live game.
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    const rosterById = {};
+    roster.forEach(p => { rosterById[p.id] = p; });
+    const nowT = liveNow(live);
+    const { pairs, ledger, cameOnAt } = suggestSubs(live, nowT, rosterById);
+    const nudge = liveNudge(ledger, nowT);
+    const onPitch = ledger.filter(l => l.on);
+    const bench = ledger.filter(l => !l.on);
+    const running = !!live.resumedAt && !live.ended;
+    const subs = [...live.events].filter(e => e.type === "sub").sort((a, b) => b.t - a.t);
+
+    const posOrder = { GK: 0, DEF: 1, MID: 2, FWD: 3 };
+    const sortedPitch = [...onPitch].sort((a, b) => (posOrder[a.pos] ?? 9) - (posOrder[b.pos] ?? 9));
+
+    const debtColor = (d) => d > 120000 ? "#4ade80" : d < -120000 ? "#fbbf24" : "rgba(255,255,255,0.45)";
+
+    return (
+      <div>
+        {/* Clock */}
+        <div style={{ ...S.card, textAlign: "center", padding: "16px 14px" }}>
+          <div style={{ fontSize: 52, fontWeight: 900, fontFamily: "monospace", letterSpacing: -2, lineHeight: 1, color: live.ended ? "rgba(255,255,255,0.4)" : running ? "white" : "#fcd34d" }}>
+            {fmtClock(nowT)}
+          </div>
+          <div style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: 1.2, marginTop: 4, color: live.ended ? "rgba(255,255,255,0.3)" : running ? "#4ade80" : "#fcd34d", fontWeight: 700 }}>
+            {live.ended ? "Full Time" : running ? "Running" : "Paused"}
+          </div>
+          {!live.ended && (
+            <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+              <button onClick={toggleClock} style={{
+                flex: 1, padding: "12px", borderRadius: 8, border: "none", fontSize: 14, fontWeight: 800, cursor: "pointer",
+                background: running ? "rgba(251,191,36,0.18)" : "linear-gradient(135deg, #22c55e, #15803d)",
+                color: running ? "#fcd34d" : "white", textTransform: "uppercase", letterSpacing: 0.5,
+              }}>{running ? "❚❚ Pause" : "▶ Resume"}</button>
+              <button onClick={endLiveGame} style={{
+                padding: "12px 16px", borderRadius: 8, border: "1px solid rgba(255,255,255,0.15)",
+                background: "rgba(0,0,0,0.3)", color: "rgba(255,255,255,0.5)", fontSize: 12, fontWeight: 700, cursor: "pointer",
+              }}>End</button>
+            </div>
+          )}
+        </div>
+
+        {/* Light driving: one passive line, never an alarm */}
+        {nudge && !live.ended && (
+          <div style={{ margin: "10px 12px", padding: "10px 12px", borderRadius: 10, background: "rgba(74,222,128,0.08)", border: "1px solid rgba(74,222,128,0.2)", fontSize: 12, color: "#86efac" }}>
+            <strong>{nudge.count}</strong> {nudge.count === 1 ? "player is" : "players are"} over 3 min short
+            {nudge.names.length > 0 && <span style={{ color: "rgba(255,255,255,0.5)" }}> — {nudge.names.join(", ")}</span>}
+          </div>
+        )}
+
+        {/* Suggestions */}
+        {!live.ended && pairs.length > 0 && (
+          <div style={S.card}>
+            <div style={{ fontSize: 13, fontWeight: 700, color: "#4ade80", marginBottom: 4 }}>Suggested Subs</div>
+            <div style={{ fontSize: 10, color: "rgba(255,255,255,0.3)", marginBottom: 10 }}>Tap to record. Ignore freely — nothing is locked in.</div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              {pairs.map(p => (
+                <button key={`${p.off.id}-${p.on.id}`} onClick={() => applyLiveSub(p.off.id, p.on.id, p.pos)} style={{
+                  display: "flex", alignItems: "center", gap: 8, padding: "10px 12px", borderRadius: 10,
+                  border: "1px solid rgba(74,222,128,0.2)", background: "rgba(0,0,0,0.25)", cursor: "pointer",
+                  width: "100%", textAlign: "left", color: "inherit",
+                }}>
+                  <span style={{ fontSize: 9, fontWeight: 800, padding: "3px 6px", borderRadius: 4, background: "rgba(255,255,255,0.08)", color: "rgba(255,255,255,0.5)", flexShrink: 0 }}>{p.pos}</span>
+                  <span style={{ flex: 1, minWidth: 0, fontSize: 13 }}>
+                    <span style={{ color: "#fde68a", fontWeight: 700 }}>▼ {p.off.player.name}</span>
+                    <span style={{ color: "rgba(255,255,255,0.25)" }}> → </span>
+                    <span style={{ color: "#86efac", fontWeight: 700 }}>▲ {p.on.player.name}</span>
+                  </span>
+                  <span style={{ fontSize: 10, color: "rgba(255,255,255,0.35)", fontFamily: "monospace", flexShrink: 0 }}>
+                    {fmtSigned(p.on.debt)}
+                  </span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* On the pitch */}
+        <div style={S.card}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+            <div style={{ fontSize: 13, fontWeight: 700, color: "#4ade80" }}>On the Pitch ({onPitch.length})</div>
+            {!live.ended && <span style={{ fontSize: 10, color: "rgba(255,255,255,0.3)" }}>tap to sub off</span>}
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+            {sortedPitch.map(l => (
+              <div key={l.id}>
+                <button
+                  onClick={() => !live.ended && setLiveSubOff(liveSubOff === l.id ? null : l.id)}
+                  style={{
+                    display: "flex", alignItems: "center", gap: 8, padding: "9px 10px", borderRadius: 8, width: "100%", textAlign: "left",
+                    border: liveSubOff === l.id ? "1px solid rgba(248,113,113,0.5)" : "1px solid rgba(255,255,255,0.05)",
+                    background: liveSubOff === l.id ? "rgba(248,113,113,0.1)" : "rgba(0,0,0,0.2)",
+                    cursor: live.ended ? "default" : "pointer", color: "inherit",
+                  }}>
+                  <span style={{ fontSize: 9, fontWeight: 800, padding: "3px 6px", borderRadius: 4, background: l.pos === "GK" ? "rgba(96,165,250,0.2)" : "rgba(255,255,255,0.07)", color: l.pos === "GK" ? "#93c5fd" : "rgba(255,255,255,0.5)", flexShrink: 0, width: 32, textAlign: "center" }}>{l.pos}</span>
+                  <span style={{ width: 18, height: 18, borderRadius: "50%", background: TIER_COLORS[l.player.tier], display: "flex", alignItems: "center", justifyContent: "center", fontSize: 9, fontWeight: 800, color: "white", flexShrink: 0 }}>{l.player.tier}</span>
+                  <span style={{ flex: 1, fontSize: 13, fontWeight: 600 }}>{l.player.name}</span>
+                  <span style={{ fontSize: 11, fontFamily: "monospace", color: "rgba(255,255,255,0.5)" }}>{fmtClock(l.accrued)}</span>
+                  <span style={{ fontSize: 11, fontFamily: "monospace", fontWeight: 700, color: debtColor(l.debt), width: 46, textAlign: "right" }}>{fmtSigned(l.debt)}</span>
+                </button>
+                {liveSubOff === l.id && !live.ended && (
+                  <div style={{ margin: "4px 0 8px 0", padding: 10, borderRadius: 8, background: "rgba(0,0,0,0.3)", border: "1px solid rgba(255,255,255,0.08)" }}>
+                    <div style={{ fontSize: 10, color: "rgba(255,255,255,0.4)", marginBottom: 6 }}>
+                      Bring on for <strong style={{ color: "#fde68a" }}>{l.player.name}</strong> at {l.pos} — most owed first
+                    </div>
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+                      {bench.map(b => {
+                        const fits = canPlayField(b.player, l.pos) || (l.pos === "GK" && canPlayGK(b.player));
+                        return (
+                          <button key={b.id} onClick={() => applyLiveSub(l.id, b.id, l.pos)} style={{
+                            padding: "6px 10px", borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: "pointer",
+                            border: fits ? "1px solid rgba(74,222,128,0.3)" : "1px solid rgba(255,255,255,0.08)",
+                            background: fits ? "rgba(74,222,128,0.08)" : "rgba(0,0,0,0.25)",
+                            color: fits ? "#86efac" : "rgba(255,255,255,0.35)",
+                          }}>
+                            {b.player.name}
+                            <span style={{ fontSize: 9, marginLeft: 4, fontFamily: "monospace", opacity: 0.7 }}>{fmtSigned(b.debt)}</span>
+                            {!fits && <span style={{ fontSize: 8, marginLeft: 3, opacity: 0.6 }}>⚠</span>}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Bench */}
+        <div style={S.card}>
+          <div style={{ fontSize: 13, fontWeight: 700, color: "#4ade80", marginBottom: 8 }}>Bench ({bench.length}) — most owed first</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+            {bench.map(l => (
+              <div key={l.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 10px", borderRadius: 8, background: "rgba(0,0,0,0.2)" }}>
+                <span style={{ width: 18, height: 18, borderRadius: "50%", background: TIER_COLORS[l.player.tier], display: "flex", alignItems: "center", justifyContent: "center", fontSize: 9, fontWeight: 800, color: "white", flexShrink: 0 }}>{l.player.tier}</span>
+                <span style={{ flex: 1, fontSize: 13, fontWeight: 600, color: "rgba(255,255,255,0.75)" }}>{l.player.name}</span>
+                <span style={{ fontSize: 11, fontFamily: "monospace", color: "rgba(255,255,255,0.4)" }}>{fmtClock(l.accrued)}</span>
+                <span style={{ fontSize: 11, fontFamily: "monospace", fontWeight: 700, color: debtColor(l.debt), width: 46, textAlign: "right" }}>{fmtSigned(l.debt)}</span>
+              </div>
+            ))}
+            {bench.length === 0 && <span style={{ fontSize: 12, color: "rgba(255,255,255,0.3)", fontStyle: "italic" }}>Nobody on the bench</span>}
+          </div>
+          <div style={{ marginTop: 8, fontSize: 10, color: "rgba(255,255,255,0.3)" }}>
+            Elapsed {fmtClock(nowT)} · fair share {fmtClock(9 * nowT / (live.present.length || 1))} each
+          </div>
+        </div>
+
+        {/* Log — back-dating lives here */}
+        <div style={S.card}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <div style={{ fontSize: 13, fontWeight: 700, color: "#4ade80" }}>Sub Log ({subs.length})</div>
+            <div style={{ display: "flex", gap: 6 }}>
+              {live.events.length > 1 && (
+                <button onClick={undoLastEvent} style={{ padding: "4px 10px", borderRadius: 6, border: "1px solid rgba(255,255,255,0.12)", background: "rgba(0,0,0,0.25)", color: "rgba(255,255,255,0.5)", fontSize: 10, fontWeight: 700, cursor: "pointer" }}>↶ Undo</button>
+              )}
+              <button onClick={() => setShowLog(v => !v)} style={{ padding: "4px 10px", borderRadius: 6, border: "1px solid rgba(255,255,255,0.12)", background: "rgba(0,0,0,0.25)", color: "rgba(255,255,255,0.5)", fontSize: 10, fontWeight: 700, cursor: "pointer" }}>{showLog ? "Hide" : "Show"}</button>
+            </div>
+          </div>
+          {showLog && (
+            <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 5 }}>
+              <div style={{ fontSize: 10, color: "rgba(255,255,255,0.3)" }}>
+                Subbed later than you meant to? Nudge the time — every total recalculates.
+              </div>
+              {subs.map(e => (
+                <div key={e.seq} style={{ display: "flex", alignItems: "center", gap: 6, padding: "7px 9px", borderRadius: 8, background: "rgba(0,0,0,0.22)" }}>
+                  <span style={{ fontSize: 12, fontFamily: "monospace", fontWeight: 700, width: 44, color: "rgba(255,255,255,0.75)" }}>{fmtClock(e.t)}</span>
+                  <span style={{ flex: 1, minWidth: 0, fontSize: 11 }}>
+                    <span style={{ color: "#fde68a" }}>{rosterById[e.off] ? rosterById[e.off].name : "?"}</span>
+                    <span style={{ color: "rgba(255,255,255,0.25)" }}> → </span>
+                    <span style={{ color: "#86efac" }}>{rosterById[e.on] ? rosterById[e.on].name : "?"}</span>
+                  </span>
+                  {!live.ended && (
+                    <React.Fragment>
+                      <button onClick={() => nudgeEventTime(e.seq, -30000)} style={{ padding: "3px 7px", borderRadius: 5, border: "1px solid rgba(255,255,255,0.12)", background: "rgba(0,0,0,0.3)", color: "rgba(255,255,255,0.5)", fontSize: 10, cursor: "pointer", fontWeight: 700 }}>−30s</button>
+                      <button onClick={() => nudgeEventTime(e.seq, 30000)} style={{ padding: "3px 7px", borderRadius: 5, border: "1px solid rgba(255,255,255,0.12)", background: "rgba(0,0,0,0.3)", color: "rgba(255,255,255,0.5)", fontSize: 10, cursor: "pointer", fontWeight: 700 }}>+30s</button>
+                    </React.Fragment>
+                  )}
+                </div>
+              ))}
+              {subs.length === 0 && <span style={{ fontSize: 11, color: "rgba(255,255,255,0.3)", fontStyle: "italic" }}>No subs yet</span>}
+            </div>
+          )}
+        </div>
+
+        <div style={{ margin: "10px 12px" }}>
+          <button onClick={discardLiveGame} style={{ width: "100%", padding: "9px", borderRadius: 8, border: "1px solid rgba(239,68,68,0.2)", background: "rgba(239,68,68,0.06)", color: "#fca5a5", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>
+            Discard Live Game
+          </button>
+        </div>
+      </div>
+    );
+  };
+
   return (
     <div style={S.app}>
       <div style={S.header}>
@@ -1810,13 +2319,17 @@ function SoccerApp() {
         <div style={S.nav}>
           <button style={S.navBtn(screen==="roster")} onClick={() => setScreen("roster")}>Roster</button>
           <button style={S.navBtn(screen==="gameday")} onClick={() => setScreen("gameday")}>Game Day</button>
-          <button style={S.navBtn(screen==="schedule")} onClick={() => setScreen("schedule")}>Schedule</button>
+          <button style={S.navBtn(screen==="schedule")} onClick={() => setScreen("schedule")}>Plan</button>
+          <button style={S.navBtn(screen==="live")} onClick={() => setScreen("live")}>
+            Live{live && !live.ended ? " ●" : ""}
+          </button>
         </div>
       </div>
       <div style={{ maxWidth: 480, margin: "0 auto" }}>
         {screen === "roster" && renderRoster()}
         {screen === "gameday" && renderGameDay()}
         {screen === "schedule" && renderSchedule()}
+        {screen === "live" && renderLive()}
       </div>
     </div>
   );
